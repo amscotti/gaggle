@@ -1,0 +1,66 @@
+# =============================================================================
+# confirm — confirmation pass after a green verify (gaggle)
+# Checks ONLY the existing work-order findings. Does not invent new ones.
+# The harness commits on green verify regardless; still_open items are the
+# next fix-cycle work order or leftover report items.
+#
+# Ends with one JSON line:
+#   {"still_open": ["...", "..."]}
+# empty array = every original finding is fixed or invalid.
+#
+# Model: NOT pinned here — the harness driver pins provider/model from
+# .review/config.toml when set, else goose uses its configured default.
+# (A repo override in .review/workflows/ may pin via settings: itself.)
+# =============================================================================
+version: 1.0.0
+id: confirm
+title: "Confirm findings in {{component}}"
+description: Checks whether the listed findings are still present
+instructions: |
+  You are CONFIRMING whether specific findings for component
+  "{{component}}" ({{component_name}}) are still present.
+
+  FILE PATHS:
+  {{component_paths}}
+
+  FINDINGS TO CHECK — open and read this file:
+  {{findings_file}}
+  Each numbered item is a finding from an earlier review. That list is the
+  ONLY work. Do not review the rest of the component. Do not add new
+  findings. Do not rephrase issues into new items.
+
+  For each numbered finding decide:
+  - still_open: the problem is still in the code
+  - otherwise: it is fixed, or the finding was invalid
+
+  RULES:
+  - Read the relevant code before judging.
+  - Copy still-open items as the original finding text (you may trim).
+  - Do NOT modify any files. Do NOT run tests/build.
+  - Do NOT access the network.
+
+  REPORT: end with EXACTLY ONE JSON line — nothing after it:
+  {"still_open": ["...", "..."]}
+  (empty array = nothing left from the work order)
+prompt: "Confirm the listed findings for component {{component}}; end with one JSON line: {\"still_open\": [\"...\"]}"
+parameters:
+  - key: component
+    input_type: string
+    requirement: required
+    description: Component slug
+  - key: component_name
+    input_type: string
+    requirement: optional
+    default: ""
+    description: Human-readable component name
+  - key: component_paths
+    input_type: string
+    requirement: required
+    description: File paths this component covers
+  - key: findings_file
+    input_type: string
+    requirement: required
+    description: Path to the numbered work-order findings
+extensions:
+  - type: builtin
+    name: developer

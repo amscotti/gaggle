@@ -1,0 +1,67 @@
+# =============================================================================
+# verify — VERIFY phase recipe (gaggle)
+# The harness already ran the configured verify commands. This agent only
+# classifies a FAILURE (fix vs environmental) and restates diagnostics.
+# It cannot mark the gate as passed.
+#
+# Ends with one JSON line the harness parses:
+#   {"cause": "fix|environmental", "diagnostics": "..."}
+#
+# Model: NOT pinned here — the harness driver pins provider/model from
+# .review/config.toml when set, else goose uses its configured default.
+# (A repo override in .review/workflows/ may pin via settings: itself.)
+# =============================================================================
+version: 1.0.0
+id: verify
+title: "Classify verify failure for {{component}}"
+description: Judges why a harness-run verify command failed
+instructions: |
+  You are classifying a VERIFY FAILURE for component "{{component}}"
+  ({{component_name}}) in this repository.
+
+  The harness already ran the configured verify commands. They FAILED.
+  Do NOT re-run the test suite or build. Read the diagnostics file and
+  the changed code if you need evidence.
+
+  Diagnostics from the failing command are in:
+  {{diagnostics_file}}
+  (Open that file and read it.)
+
+  The fixer last changed code under: {{component_paths}}
+
+  ## Judgment
+  Decide the CAUSE:
+  - **fix**: the failure is caused by the code the fixer changed (compile
+    error in the touched file, a test it broke, a lint violation). This is
+    the common case — the fixer must fix it.
+  - **environmental**: the failure is NOT attributable to the fixer's
+    changes (missing tool, network, pre-existing failure present before
+    this component's work, flaky test). Rare — call this only with
+    evidence (e.g. the failing file is untouched by the fixer, or the
+    command is unavailable).
+
+  ## Report
+  End with EXACTLY ONE JSON line — nothing after it:
+  {"cause": "fix|environmental", "diagnostics": "<tail of the failing command's output, exact file:line errors, max ~4KB>"}
+prompt: "Classify the verify failure for component {{component}}; end with one JSON line: {\"cause\": \"fix|environmental\", \"diagnostics\": \"...\"}"
+parameters:
+  - key: component
+    input_type: string
+    requirement: required
+    description: Component slug (e.g. loop-engine)
+  - key: component_name
+    input_type: string
+    requirement: optional
+    default: ""
+    description: Human-readable component name
+  - key: component_paths
+    input_type: string
+    requirement: required
+    description: File paths this component covers
+  - key: diagnostics_file
+    input_type: string
+    requirement: required
+    description: Path to the harness-captured verify output
+extensions:
+  - type: builtin
+    name: developer

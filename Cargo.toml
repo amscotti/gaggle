@@ -1,0 +1,23 @@
+[package]
+name = "gaggle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Checklist-driven autonomous code review/fix loop on the Goose GDK stack"
+license = "Apache-2.0"
+repository = "https://github.com/amscotti/gaggle"
+readme = "README.md"
+keywords = ["code-review", "ai-agents", "goose", "automation", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Install from git (not yet published to crates.io):
+#   cargo install --git https://github.com/amscotti/gaggle
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+# chrono: `clock` (needed for Utc::now) implies `std`, so
+# default-features = false would be a silent no-op — declare it plainly.
+chrono = { version = "0.4", features = ["serde", "clock"] }

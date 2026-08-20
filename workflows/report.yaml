@@ -1,0 +1,59 @@
+# =============================================================================
+# report — FINAL REPORT recipe (gaggle)
+# Runs at the END of every loop. The harness computes the deterministic
+# RUN SUMMARY itself (counts, commits, model — from state, cannot drift);
+# this agent does ONLY the judgment part: distilling unresolved findings
+# into OPEN QUESTIONS a human must decide.
+# The harness writes the combined strict-format .review/final-report.md.
+#
+# Model: NOT pinned here — the harness driver pins provider/model from
+# .review/config.toml when set, else goose uses its configured default.
+# (A repo override in .review/workflows/ may pin via settings: itself.)
+# =============================================================================
+version: 1.0.0
+id: report
+title: "Final report open questions"
+description: Distills unresolved findings into decisions for the user
+instructions: |
+  You are writing the OPEN QUESTIONS section of a gaggle final review
+  report. The run is finished; the harness has already computed the
+  summary counts. Read:
+
+  1. {{run_ledger}} — the per-component results file (phase, findings,
+     commit, detail)
+  2. {{findings_dir}} — a directory of per-component findings files.
+     A findings file exists exactly when a component has UNRESOLVED
+     items: FAILED components (all their leftover findings) and DONE
+     components that finished with leftovers (see the ledger detail).
+     Done components with no findings file are fully clean.
+
+  For each component with unresolved findings (FAILED or DONE-with-
+  leftovers — check the ledger to tell them apart), distill its findings
+  into the DECISION the user must make. Each question must:
+  - start with the component slug in brackets, e.g. "[game-engine] ..."
+  - frame the tradeoff in 1-3 sentences
+  - list concrete options: (a) ..., (b) ..., (c) ...
+  - recommend one option with a one-line reason
+  - be specific enough that a coding agent could act on the chosen option
+
+  Do NOT number the questions (the harness numbers them). Do NOT write
+  any summary/count section. Do NOT modify files or run commands —
+  read-only synthesis.
+
+  REPORT: end your response with EXACTLY ONE JSON line — nothing after it:
+  {"questions": ["[slug] ... Options: (a) ... (b) ... Recommendation: ...", ...]}
+  If no component has unresolved findings, return:
+  {"questions": []}
+prompt: "Write the open questions for the final report; end with one JSON line: {\"questions\": [\"...\"]}"
+parameters:
+  - key: run_ledger
+    input_type: string
+    requirement: required
+    description: Path to the run ledger (component results)
+  - key: findings_dir
+    input_type: string
+    requirement: required
+    description: Path to the findings directory
+extensions:
+  - type: builtin
+    name: developer

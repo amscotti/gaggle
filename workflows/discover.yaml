@@ -1,0 +1,102 @@
+# =============================================================================
+# discover — AI component discovery recipe (gaggle)
+# ONE agent invocation that explores the repo and invents a component
+# checklist. The harness validates the JSON (slug/paths/tier/limits) — the
+# agent never touches state. Ported from the Go original's discover.tmpl.
+#
+# Model: NOT pinned here — the harness driver pins provider/model from
+# .review/config.toml when set, else goose uses its configured default.
+# (A repo override in .review/workflows/ may pin via settings: itself.)
+# =============================================================================
+version: 1.0.0
+id: discover
+title: "Discover components in {{project_name}}"
+description: Invent a component checklist for the repo, returned as JSON
+instructions: |
+  Create a Gaggle component checklist for this repository ({{project_name}}).
+
+  A **component** is one logical segment of the codebase that should be
+  reviewed and fixed on its own: a package, module, layer, command group, or
+  cohesive subsystem (with its tests when they live nearby). Not the whole
+  repo, not every file.
+
+  ## Component fields
+  | field | meaning |
+  |-------|--------|
+  | slug | stable id: lowercase a-z0-9 segments joined by hyphens |
+  | name | short human title |
+  | description | responsibility: what it owns, who uses it, what must hold (2-4 sentences). When behavior is user-facing, note that fixes should keep related docs accurate. |
+  | paths | repo-relative dirs/files this component covers (use /; no ..) |
+  | tier | high / medium / low — how critical mistakes here are |
+  | priority | integer — relative importance of spending review/fix effort (higher first) |
+
+  ## Priority and tier (spend time on what matters)
+  Runs often process every component eventually; priority ranks importance,
+  not a strict dependency graph. Put the highest priorities on correctness,
+  safety, data, and core orchestration — the places bugs hurt most. Use
+  distinct integers within a tier so ties do not hide ranking.
+  Suggested bands: high 80-100 (spread), medium 40-70, low 5-25.
+  Prefer higher priority for: security boundaries, persistence, agent
+  drivers, orchestration state machines, anything that mutates repos/git.
+  Prefer lower priority for: optional integrations, pure heuristics, polish.
+
+  ## Quality bar
+  - Split by logical ownership, not one giant root and not one component per file.
+  - Split large entrypoints: a big CLI/main that wires many commands and the
+    run loop should become several components, with paths pointing at the
+    specific files each owns.
+  - Prefer directory-level paths; use file-level paths when splitting one package.
+  - Include the package's tests when they live nearby.
+  - Include CI and build tooling as components when present (workflows/,
+    Cargo.toml/go.mod build config, packaging, .golangci.yml). Review that
+    gates match how the project actually builds and tests.
+  - Empty command packages (cmd/<name>/ with no source files) and missing
+    mains that build scripts reference are holes — put them on a CLI/build
+    component so they get an entrypoint.
+  - Do NOT invent a standalone "docs only" component. Docs stay in sync as
+    part of fixing the owning components (say so in descriptions).
+  - Skip generated/vendor noise (build/, node_modules/, target/, .gradle/, bin/).
+  - Typical medium repo: about 6-18 components after splitting large CLIs and CI.
+  - Every component needs non-empty paths and a real description.
+  - tier is the string high|medium|low; priority is an integer (not a string).
+  EXISTING CHECKLIST: open and read the file at {{existing}}.
+  If that file says there is no existing checklist, invent fresh slugs.
+  Otherwise you are RE-RUNNING discovery — reconcile as follows.
+
+  ## Reconcile an existing checklist (when the file lists components)
+  For EACH existing component in that file, decide:
+  - KEEP (reuse the slug) if the code it covers still exists — you may
+    refine its paths/name/description to match the current code.
+  - DROP it entirely if its code has been removed, renamed, merged, or
+    deprecated — do not keep dead components on the list.
+  - ADD new slugs for any new areas of the codebase not covered above.
+  The goal is a CURRENT, ACCURATE checklist — not a superset, not a
+  subset. When in doubt about an existing component, keep it (dropping a
+  live component is worse than keeping a stale one).
+
+  ## Output
+  Inspect the repo as needed (read files, list dirs, check build config),
+  then answer with ONLY a JSON object of the form shown (optional markdown fence):
+
+  {"components": [
+    {"slug": "loop-engine", "name": "Review/fix loop", "description": "Owns the state machine and orchestration. Called by main; must persist state between phases.", "paths": ["src/loop_engine.rs"], "tier": "high", "priority": 100}
+  ]}
+
+  End your response with exactly one JSON line of the form:
+  {"components": [...]}
+  (nothing after it)
+prompt: "Discover the component checklist for this repository; end with one JSON line: {\"components\": [...]}"
+parameters:
+  - key: project_name
+    input_type: string
+    requirement: optional
+    default: "gaggle"
+    description: Short label for the repo (usually directory basename)
+  - key: existing
+    input_type: string
+    requirement: optional
+    default: "No existing checklist. Invent fresh slugs for every component."
+    description: Path to a file describing any existing checklist to reconcile
+extensions:
+  - type: builtin
+    name: developer

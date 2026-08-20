@@ -1,0 +1,65 @@
+# =============================================================================
+# review — REVIEW phase recipe (gaggle)
+# Delegated goose agent that reviews one component of the repo and reports
+# findings as a final JSON line. The harness parses that line; it never
+# guesses from prose.
+#
+# Model: NOT pinned here — the harness driver pins provider/model from
+# .review/config.toml when set, else goose uses its configured default.
+# (A repo override in .review/workflows/ may pin via settings: itself.)
+# =============================================================================
+version: 1.0.0
+id: review
+title: "Review component {{component}}"
+description: Reviews one repo component and returns findings as JSON
+instructions: |
+  You are the code REVIEWER for the component "{{component}}"
+  ({{component_name}}) in this repository.
+
+  FILE PATHS — READ THE CODE AT THESE PATHS, THEN JUDGE:
+  {{component_paths}}
+  The component's code lives at the paths above. Open and read each file
+  line by line BEFORE deciding. Do not review from memory or guesswork.
+
+  Your job: review the component's code for real, actionable issues:
+  - Correctness bugs (off-by-one, wrong conditions, edge cases)
+  - Logic errors that would fail under realistic inputs
+  - Concurrency / safety problems (panics, unwraps on user input, races)
+  - Clear performance traps (accidental O(n²), unbounded loops)
+  - API misuse or missing error handling
+  - Style problems ONLY if they cause bugs (not cosmetic preferences)
+
+  SCRUTINY BAR: empty findings are ONLY acceptable after you have actually
+  read every file above. If you have not opened the files, you MUST say so
+  and report at least a "scope unverified" finding. Real code has real
+  issues — be rigorous, not polite.
+
+  RULES:
+  - Read the actual code for this component before judging.
+  - Each finding must be SPECIFIC: name the file, the function, the exact
+    problem, and a concrete fix. Vague or cosmetic findings are noise.
+  - If the component is genuinely fine, report an EMPTY findings list.
+  - Do NOT modify any files. Do NOT run the project's tests/build.
+  - Do NOT access the network.
+
+  REPORT: end your response with EXACTLY ONE JSON line — nothing after it:
+  {"findings": ["...", "..."]}
+  (empty array = component is clean. Keep each finding to 1-3 sentences.)
+prompt: "Review component {{component}} in this repo; end with one JSON line: {\"findings\": [\"...\"]}"
+parameters:
+  - key: component
+    input_type: string
+    requirement: required
+    description: Component slug (e.g. src-goose)
+  - key: component_name
+    input_type: string
+    requirement: optional
+    default: ""
+    description: Human-readable component name
+  - key: component_paths
+    input_type: string
+    requirement: required
+    description: File paths for this component (comma/space separated)
+extensions:
+  - type: builtin
+    name: developer

@@ -1,0 +1,70 @@
+# =============================================================================
+# fix — FIX phase recipe (gaggle)
+# Delegated goose agent that fixes the findings the review phase produced.
+# Ends with a final JSON line the harness parses:
+#   {"outcome": "fixed" | "nothing_to_fix"}
+# The harness then runs verify; only a passing verify leads to a commit
+# (the harness commits — the agent never does).
+#
+# Model: NOT pinned here — the harness driver pins provider/model from
+# .review/config.toml when set, else goose uses its configured default.
+# (A repo override in .review/workflows/ may pin via settings: itself.)
+# =============================================================================
+version: 1.0.0
+id: fix
+title: "Fix findings in {{component}}"
+description: Fixes review findings in one repo component
+instructions: |
+  You are the FIXER for the component "{{component}}" ({{component_name}}).
+
+  FILES: the component's code lives at: {{component_paths}}
+  Read the relevant files before changing anything.
+
+  The reviewer found these issues — READ THEM:
+  {{findings_file}}
+  (Open that file and read every finding before making any change.)
+
+  Your job: fix the REAL issues in the component's code. If a finding is
+  wrong or already addressed, say so in your summary — do not make changes
+  "for the sake of it".
+
+  RULES:
+  - The component's files are your STARTING POINT and primary focus.
+  - Stay anchored there: don't wander into unrelated refactors. Minimal diffs.
+  - But fix for COMPLETENESS: if a change requires updating call sites,
+    registrations, docs, or tests in other files to keep the whole codebase
+    correct, make those updates too — a fix that only compiles inside the
+    component is not done.
+  - Keep tests in sync: update or extend specs that cover the behavior
+    you changed (they often live next to the component's files).
+  - Do NOT run the full test suite or build (the harness does that next and
+    will bounce the fix back to you if it fails).
+  - Do NOT commit. The harness owns git.
+  - Do NOT access the network.
+
+  REPORT: end your response with EXACTLY ONE JSON line — nothing after it:
+  {"outcome": "fixed"}
+  or, if you verified every finding is already resolved or invalid:
+  {"outcome": "nothing_to_fix"}
+prompt: "Fix the findings in component {{component}}; end with one JSON line: {\"outcome\": \"fixed\" | \"nothing_to_fix\"}"
+parameters:
+  - key: component
+    input_type: string
+    requirement: required
+    description: Component slug (e.g. src-goose)
+  - key: component_name
+    input_type: string
+    requirement: optional
+    default: ""
+    description: Human-readable component name
+  - key: component_paths
+    input_type: string
+    requirement: required
+    description: File paths for this component (comma/space separated)
+  - key: findings_file
+    input_type: string
+    requirement: required
+    description: Path to the file containing the numbered review findings
+extensions:
+  - type: builtin
+    name: developer

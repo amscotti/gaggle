@@ -1,0 +1,87 @@
+# gaggle repo config — copied into .review/ by the harness or hand-written.
+# `gaggle init` detects go.mod / Cargo.toml / package.json / pytest and writes
+# matching verify commands; this file is the Rust default.
+# verify commands run after every fix; the fix is only committed if all pass.
+#
+# Optional recipe overrides live in .review/workflows/<name>.yaml
+# (discover/review/confirm/fix/verify/report). Missing names use the baked-in copy.
+#
+# Each entry is passed verbatim to a shell interpreter (`sh -c` on Unix,
+# `cmd /C` on Windows), so shell metacharacters like `$`, backticks, and
+# embedded quotes are interpreted — take care with quoting. Because the
+# two shells differ, one entry per command is safest: e.g. an entry such
+# as "cargo test & cargo clippy" runs as a single sh command on Unix but
+# also runs the two commands sequentially under cmd.exe, since `&` is a
+# sequential separator there (like sh's `;`); `&&` is the conditional
+# form in both shells. The array must be non-empty (an empty `verify =
+# []` is rejected as an error).
+#
+# CROSS-PLATFORM TEAMS: the `verify` key is a single flat array shared by
+# every platform — there is no built-in per-platform override section, so
+# one config applies on both Unix and Windows. To avoid shell-divergence
+# bugs in mixed-platform repos, prefer entries that are valid verbatim in
+# BOTH `sh` and `cmd.exe`. The safe building blocks are:
+#   • bare `cargo` subcommands (cargo build, cargo test, cargo clippy)
+#     that need no shell metacharacters;
+#   • `&&` to chain commands conditionally (same meaning in both shells);
+#   • avoid `&` (backgrounds on Unix, sequences on Windows), `$`/backticks
+#     (Unix-only), and `%VAR%` (Windows-only).
+# If a check genuinely needs platform-specific shell syntax, maintain a
+# separate config.toml per platform (e.g. via a branch or a checked-in
+# config.unix.toml / config.win.toml copied into place) rather than
+# relying on a single fragile entry.
+
+verify = ["cargo build", "cargo test"]
+
+# Optional extra-slow gate, run ONCE at the end of `gaggle run` (not per
+# fix cycle). Per cycle the harness runs a scoped check when it can
+# derive one (`go test ./pkg`, `cargo test -p crate`), then this file's
+# `verify` list. Put suites too slow for that (e2e, 10+ minutes) here.
+# When unset, the regular `verify` list is run once more at run end.
+# final_verify = ["cargo build --workspace", "cargo test --workspace"]
+
+# Agent model (optional). When set, the harness exports these as
+# GOOSE_PROVIDER / GOOSE_MODEL for every recipe run, overriding goose's
+# configured default. When omitted (or a key is left out), goose resolves
+# the missing part itself: your GOOSE_* environment if exported, else the
+# default in goose's own config.yaml (`goose configure`). Nothing is
+# hard-coded and the embedded recipes never pin a model — a repo override
+# in .review/workflows/ may still pin via its own `settings:` block.
+#
+# Base keys accept both forms (pick one — TOML rejects mixing a top-level
+# `model` key with `[model.<phase>]` sections below; the section form is
+# required if you use per-phase overrides). Top-level keys must appear
+# BEFORE any [section] header:
+#
+#   provider = "custom_z.ai"
+#   model = "glm-5.3"
+#
+# or, equivalently, as a section (safe to append at the bottom):
+#
+#   [model]
+#   provider = "custom_z.ai"
+#   model = "glm-5.3"
+#
+# PER-PHASE MODELS: give any recipe its own model — e.g. a thorough
+# reviewer with a fast fixer. Keys unset in a phase section inherit from
+# the base above.
+#
+#   [model.fix]
+#   provider = "custom_deepseek"
+#   model = "deepseek-v4-flash"
+
+# [commit] controls how the harness commits.
+#   sign = true  → sign commits (uses your git/gpg setup; requires a
+#                  non-interactive signing agent or the loop will hang)
+#   sign = false → default. commits unsigned: `-c commit.gpgsign=false`
+[commit]
+sign = false
+
+# [branch] controls WHERE commits land.
+#   dedicated = false → default. commits land on the current branch.
+#   dedicated = true  → the run creates its own `gaggle/run-<timestamp>`
+#                       branch at start and commits there; you review the
+#                       whole run as a unit and merge (or revert) it via
+#                       normal git. A resumed run reuses the same branch.
+# [branch]
+# dedicated = true
