@@ -1,7 +1,9 @@
 //! The main loop: review once → fix that work order → verify → commit on
 //! green. Confirmation only asks whether those findings are still open; it
 //! does not invent new ones. A later red verify restores the last green
-//! commit instead of wiping the component.
+//! commit instead of wiping the component. Goose flakes and red checks
+//! retry / send the fixer; quarantine is only after the attempt budget
+//! is spent. A red full-suite gate is the same (classify → fix → re-run).
 
 use crate::checklist::{self, Component};
 use crate::commit;
@@ -263,38 +265,48 @@ impl Engine {
         }
 
         // End-of-run FULL gate (`final_verify` from config, or the regular
-        // `verify` list when unset). Per-cycle verify is scoped for speed
-        // (e.g. `cargo test -p touched-crate`, `go test ./pkg`); this gate
-        // catches cross-component fallout the scoped runs never executed —
-        // the redacter run shipped one fixer-broken e2e test that only the
-        // slow full suite exposed. A red result does NOT roll anything
-        // back (components are committed green under their own scope); it
-        // marks the run's status and names the failing command so the
-        // human sees it before trusting the report.
-        let final_gate = self.run_final_verify();
+        // `verify` list when unset). Per-cycle verify is the component's
+        // discovered commands (then the repo `verify` list). This gate
+        // catches what those runs never executed. A red result is a work
+        // order: classify the owning component, send the fixer, re-run.
+        // Only after that budget is spent is the run red. Prior component
+        // commits stay; a failed extra fix is wiped, not rolled back.
+        let final_gate = self.close_final_gate(&mut state)?;
+        state.save(&self.state_path())?;
+        self.persist_checklist(&state)?;
 
-        let any_failed = state.components.values().any(|c| c.phase == Phase::Failed);
-        if any_failed || !final_gate.passed {
+        let quarantined: Vec<&str> = state
+            .components
+            .values()
+            .filter(|c| c.phase == Phase::Failed)
+            .map(|c| c.slug.as_str())
+            .collect();
+        if !final_gate.passed {
             status::report(
                 &self.review_dir,
                 StatusPhase::Failed,
                 "-",
                 &format!(
-                    "loop finished{}: {}quarantined component(s){}",
-                    if final_gate.passed {
-                        ""
+                    "loop finished with a RED final verify: {}quarantined — final gate `{}` failed",
+                    if quarantined.is_empty() {
+                        "no components ".to_string()
                     } else {
-                        " with a RED final verify"
+                        format!("{} ", quarantined.join(", "))
                     },
-                    if any_failed { "" } else { "no " },
-                    if final_gate.failed_command.is_some() {
-                        format!(
-                            " — final gate `{}` failed",
-                            final_gate.failed_command.clone().unwrap_or_default()
-                        )
-                    } else {
-                        String::new()
-                    }
+                    final_gate.failed_command.clone().unwrap_or_default()
+                ),
+            )?;
+        } else if !quarantined.is_empty() {
+            // Gate is green; leftover quarantine is leftover work, not a
+            // failed run. `gaggle status` used to show Failed here and
+            // look like the suite never passed.
+            status::report(
+                &self.review_dir,
+                StatusPhase::Done,
+                "-",
+                &format!(
+                    "final verify green; quarantined (requeue to retry): {}",
+                    quarantined.join(", ")
                 ),
             )?;
         } else {
@@ -324,8 +336,9 @@ impl Engine {
         // reflect it (CI scripts gate on this).
         if !final_gate.passed {
             bail!(
-                "final verify is RED (`{}`) — see {} for the full report",
+                "final verify is RED (`{}`) — see {} and {}",
                 final_gate.failed_command.clone().unwrap_or_default(),
+                self.review_dir.join("verify-diagnostics.txt").display(),
                 self.review_dir.join("final-report.md").display()
             );
         }
@@ -341,8 +354,8 @@ impl Engine {
         let dir = self.review_dir.join("runs").join(ts.to_string());
         std::fs::create_dir_all(&dir)?;
 
-        // Copy the report and ledger as-of-run-end.
-        for name in ["final-report.md", "run-ledger.md"] {
+        // Copy the report, ledger, and verify diagnostics as-of-run-end.
+        for name in ["final-report.md", "run-ledger.md", "verify-diagnostics.txt"] {
             let src = self.review_dir.join(name);
             if src.exists() {
                 std::fs::copy(&src, dir.join(name))
@@ -406,8 +419,9 @@ impl Engine {
     }
 
     /// Run the configured `final_verify` list (falls back to `verify`)
-    /// once, at end of run. Never aborts: a red gate is a run outcome,
-    /// not a harness failure.
+    /// once. Never aborts: a red gate is a run outcome, not a harness
+    /// failure. Status is owned by the caller so a red result can still
+    /// enter the fixer instead of marking the run failed immediately.
     fn run_final_verify(&self) -> verify::RunResult {
         println!("\n=== final verify (full gate) ===");
         status::report(
@@ -425,16 +439,11 @@ impl Engine {
             Ok(r) => {
                 let cmd = r.failed_command.clone().unwrap_or_default();
                 println!("  final verify: FAIL (`{cmd}`)");
+                let diag = persist_final_diagnostics(&self.review_dir, &r);
                 eprintln!(
                     "  ⚠ the per-cycle (scoped) verifies passed but the full gate is red — \
-                     cross-component fallout or a fixer-added test the scoped runs skipped. \
-                     Inspect before trusting this run's commits."
-                );
-                let _ = status::report(
-                    &self.review_dir,
-                    StatusPhase::Failed,
-                    "-",
-                    &format!("final verify RED: `{cmd}`"),
+                     sending the fixer; full output: {}",
+                    diag.display()
                 );
                 r
             }
@@ -442,19 +451,180 @@ impl Engine {
                 // Spawning/timeout harness error: treat as red with the
                 // error named, not a crash.
                 eprintln!("  final verify: ERROR ({e:#})");
-                let _ = status::report(
-                    &self.review_dir,
-                    StatusPhase::Failed,
-                    "-",
-                    "final verify ERRORED",
-                );
-                verify::RunResult {
+                let r = verify::RunResult {
                     passed: false,
                     failed_command: Some("(final verify errored)".to_string()),
                     output: format!("{e:#}"),
+                    kill: None,
+                };
+                let diag = persist_final_diagnostics(&self.review_dir, &r);
+                eprintln!("  full output: {}", diag.display());
+                r
+            }
+        }
+    }
+
+    /// Close a red full-suite gate the same way a component's red verify
+    /// is closed: classify, fix, re-run. Does not re-review. Exhausting
+    /// the cycle budget (or a persistent environmental failure) leaves
+    /// the gate red for the caller to fail the process.
+    fn close_final_gate(&self, state: &mut State) -> Result<verify::RunResult> {
+        let mut gate = self.run_final_verify();
+        if gate.passed {
+            return Ok(gate);
+        }
+
+        let originals: std::collections::BTreeMap<String, Option<Vec<u8>>> = state
+            .components
+            .keys()
+            .map(|slug| (slug.clone(), read_optional(&self.findings_path(slug))))
+            .collect();
+
+        let mut cycles = 0usize;
+        let mut env_retries = 0usize;
+        while !gate.passed && cycles < MAX_FIX_CYCLES {
+            if gate.kill.is_some() {
+                if env_retries == 0 {
+                    env_retries += 1;
+                    println!("  final verify: stalled/timed out — retrying once (not a fix cycle)");
+                    gate = self.run_final_verify();
+                    continue;
+                }
+                break;
+            }
+
+            let classified = self.classify_final_gate(state, &gate)?;
+            if classified.cause == "environmental" && env_retries == 0 {
+                env_retries += 1;
+                println!(
+                    "  final verify: classified environmental ({}) — retrying once",
+                    classified.component
+                );
+                gate = self.run_final_verify();
+                continue;
+            }
+
+            cycles += 1;
+            println!("\n=== full-gate fix {cycles}/{MAX_FIX_CYCLES} ===");
+
+            let slug = classified.component.clone();
+            status::report(
+                &self.review_dir,
+                StatusPhase::Fixing,
+                &slug,
+                &format!("full-gate fix {cycles}/{MAX_FIX_CYCLES} — {slug}"),
+            )?;
+            let finding = gate_finding(&gate, &classified.diagnostics);
+            let outcome = match self.fix_component(state, &slug, &[finding]) {
+                Ok(o) => o,
+                Err(e) => {
+                    commit::reset_worktree(&self.repo)?;
+                    eprintln!("  gate fix failed: {e:#} — re-running the full gate");
+                    gate = self.run_final_verify();
+                    continue;
+                }
+            };
+            println!("  gate fix {cycles}: {outcome}");
+
+            let owned = self.component_paths_vec(state, &slug);
+            let tampered = gate_edits_outside_component(&self.repo, &owned)?;
+            if !tampered.is_empty() {
+                commit::reset_worktree(&self.repo)?;
+                eprintln!(
+                    "  gate fix modified verify gate file(s): {} — wiping and retrying",
+                    tampered.join(", ")
+                );
+                gate = self.run_final_verify();
+                continue;
+            }
+
+            status::report(
+                &self.review_dir,
+                StatusPhase::Verifying,
+                &slug,
+                "re-running full-suite verify after gate fix",
+            )?;
+            gate = self.run_final_verify();
+            if !gate.passed {
+                continue;
+            }
+
+            let msg = format!("gaggle({slug}): fix full-suite verify");
+            match commit::commit_dirty(&self.repo, &msg) {
+                Ok(h) if !h.is_empty() => {
+                    println!("  commit: {h}");
+                    restore_optional(
+                        &self.findings_path(&slug),
+                        originals.get(&slug).and_then(|o| o.as_deref()),
+                    );
+                    if let Some(c) = state.components.get_mut(&slug) {
+                        c.commit = Some(h.clone());
+                        c.detail = format!("fixed full-suite verify {h}");
+                    }
+                    state.save(&self.state_path())?;
+                }
+                Ok(_) => {
+                    println!("  commit: nothing new (tree already matches HEAD)");
+                    restore_optional(
+                        &self.findings_path(&slug),
+                        originals.get(&slug).and_then(|o| o.as_deref()),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  commit FAILED after green full gate: {e:#}");
+                    return Err(e);
                 }
             }
         }
+
+        if !gate.passed {
+            commit::reset_worktree(&self.repo)?;
+        }
+        Ok(gate)
+    }
+
+    /// Ask the gate recipe which component owns the red full-suite
+    /// failure. Classifier flakes and unknown slugs fall back to a
+    /// path match against the catalog so a red gate still reaches the
+    /// fixer.
+    fn classify_final_gate(&self, state: &State, gate: &verify::RunResult) -> Result<GateClass> {
+        let diagnostics = {
+            let mut d = gate.output.clone();
+            if let Some(cmd) = &gate.failed_command {
+                d = format!("command `{cmd}` failed\n{d}");
+            }
+            d
+        };
+        let diag_file = persist_final_diagnostics(&self.review_dir, gate);
+        let catalog = write_component_catalog(&self.review_dir, state)?;
+        let recipe = recipes::path(&self.repo, "gate.yaml")?;
+        let diag_str = diag_file.to_string_lossy().to_string();
+        let catalog_str = catalog.to_string_lossy().to_string();
+        let params = [
+            ("diagnostics_file", diag_str.as_str()),
+            ("components_file", catalog_str.as_str()),
+        ];
+        let parsed = match goose::run_recipe(&self.repo, &recipe, &params, Some(60)) {
+            Ok(outcome) => {
+                self.record_usage("-", &outcome.usage);
+                parse_gate_class(&outcome.result, &diagnostics)
+            }
+            Err(e) => {
+                eprintln!("  warning: gate classifier failed: {e:#} — treating as a fix");
+                GateClass {
+                    cause: "fix".to_string(),
+                    component: String::new(),
+                    diagnostics: diagnostics.clone(),
+                }
+            }
+        };
+        let slug = resolve_gate_component(state, &parsed.component, &parsed.diagnostics);
+        println!("  gate: cause={} component={slug}", parsed.cause);
+        Ok(GateClass {
+            cause: parsed.cause,
+            component: slug,
+            diagnostics: parsed.diagnostics,
+        })
     }
 
     /// Write checklist.md from current state (checkboxes + paths).
@@ -696,16 +866,37 @@ impl Engine {
             "review agent starting",
         )?;
 
-        // A recipe failure here is a COMPONENT failure, not a run failure:
-        // quarantining keeps the remaining components processing (one
-        // flaky goose run must not abort a multi-hour loop). The worktree
-        // is reset — a half-applied fix must not leak into the next
-        // component's commit.
-        let mut findings = match self.review_component(state, &slug) {
-            Ok(f) => f,
-            Err(e) => {
-                commit::reset_worktree(&self.repo)?;
-                let why = format!("review failed: {e:#}");
+        // Goose dying is a retry, not a quarantine. Only after the
+        // attempt budget is spent do we park this component and move on.
+        // Reset the worktree between attempts so a half-applied tool
+        // call cannot leak into the next try (or the next component).
+        let mut findings = None;
+        let mut review_err = String::new();
+        for attempt in 1..=MAX_FIX_CYCLES {
+            match self.review_component(state, &slug) {
+                Ok(f) => {
+                    findings = Some(f);
+                    break;
+                }
+                Err(e) => {
+                    commit::reset_worktree(&self.repo)?;
+                    review_err = format!("{e:#}");
+                    eprintln!(
+                        "  review attempt {attempt}/{MAX_FIX_CYCLES} failed: {review_err} — retrying"
+                    );
+                    status::report(
+                        &self.review_dir,
+                        StatusPhase::Reviewing,
+                        &slug,
+                        &format!("review agent failed ({attempt}/{MAX_FIX_CYCLES}) — retrying"),
+                    )?;
+                }
+            }
+        }
+        let mut findings = match findings {
+            Some(f) => f,
+            None => {
+                let why = format!("review failed after {MAX_FIX_CYCLES} attempts: {review_err}");
                 return self.quarantine(state, &slug, &why);
             }
         };
@@ -730,11 +921,14 @@ impl Engine {
         let mut last_verify_ok = false;
         let mut committed_once = false;
         let mut last_hash = String::new();
-        let mut env_parked = false;
 
         while !findings.is_empty() && cycles < MAX_FIX_CYCLES {
             cycles += 1;
-            state::transition(state, &slug, Phase::Fixing)?;
+            // Already Fixing when the previous cycle's agent died before
+            // verify — skip the self-transition (not in the machine).
+            if state.get(&slug).map(|c| c.phase) != Some(Phase::Fixing) {
+                state::transition(state, &slug, Phase::Fixing)?;
+            }
             state.save(&self.state_path())?;
             status::report(
                 &self.review_dir,
@@ -748,15 +942,16 @@ impl Engine {
             )?;
 
             let work_order = findings.clone();
-            // Same quarantine-not-abort policy as review: a fixer recipe
-            // failure (goose flake, timeout) parks this component and
-            // keeps the loop alive for the rest.
+            // Goose flake/kill: spend this cycle, keep the work order,
+            // try again. Quarantine only when the budget is gone.
             let outcome = match self.fix_component(state, &slug, &findings) {
                 Ok(o) => o,
                 Err(e) => {
                     commit::reset_worktree(&self.repo)?;
-                    let why = format!("fix failed in cycle {cycles}: {e:#}");
-                    return self.quarantine(state, &slug, &why);
+                    eprintln!("  fix {cycles}: agent failed: {e:#} — retrying (cycle spent)");
+                    state
+                        .set_detail(&slug, &format!("fix agent failed in cycle {cycles}: {e:#}"))?;
+                    continue;
                 }
             };
             println!("  fix {cycles}: {outcome}");
@@ -772,27 +967,19 @@ impl Engine {
 
             let v = self.verify_until_stable(state, &slug)?;
             if v.passed {
-                // Gate-tampering guard: if the fixer's dirty set touches a
-                // file the verify gate executes/references, the PASS is
-                // untrustworthy — the agent may have rewritten the gate
-                // instead of passing it (observed in the wild: a fixer
-                // replaced a failing verify script with a test suite for a
-                // utility binary it wrote). Quarantine; a human edits the
-                // gate deliberately, not the fixer.
-                let gates = verify::gate_files(&self.repo);
-                if !gates.is_empty() {
-                    let tampered: Vec<String> = commit::dirty_paths(&self.repo)?
-                        .into_iter()
-                        .filter(|p| gates.contains(p))
-                        .collect();
-                    if !tampered.is_empty() {
-                        let why = format!(
-                            "fixer modified verify gate file(s): {} — refusing to commit a \
-                             green result produced by a gate the agent changed",
-                            tampered.join(", ")
-                        );
-                        return self.quarantine(state, &slug, &why);
-                    }
+                // Gate-tampering: rewriting a verify script that is not
+                // this component's work is cheating. Editing a gate file
+                // that this component owns (CI owns verify-artifacts.sh)
+                // is the review — verify already passed with that edit.
+                let owned = self.component_paths_vec(state, &slug);
+                let tampered = gate_edits_outside_component(&self.repo, &owned)?;
+                if !tampered.is_empty() {
+                    let why = format!(
+                        "fixer modified verify gate file(s): {} — refusing to commit a \
+                         green result produced by a gate the agent changed",
+                        tampered.join(", ")
+                    );
+                    return self.quarantine(state, &slug, &why);
                 }
                 last_verify_ok = true;
                 println!("  verify: PASS");
@@ -818,10 +1005,10 @@ impl Engine {
                     &slug,
                     "confirming work-order findings",
                 )?;
-                // A confirm recipe flake must not abort the remaining
-                // components (review/fix already quarantine). The commit
-                // already landed — treat the work order as still open so
-                // the next cycle retries rather than claiming closure.
+                // A confirm recipe flake must not close the work order.
+                // The commit already landed — treat findings as still
+                // open so the next cycle retries rather than claiming
+                // closure.
                 let still = match self.confirm_component(state, &slug, &work_order) {
                     Ok(s) => s,
                     Err(e) => {
@@ -854,18 +1041,7 @@ impl Engine {
             last_verify_ok = false;
             let cause = v.cause.as_deref().unwrap_or("fix");
             let diagnostics = v.diagnostics.as_deref().unwrap_or("");
-            println!("  verify: FAIL (cause={cause})");
-            if cause == "environmental" {
-                env_parked = true;
-                state.set_detail(
-                    &slug,
-                    &format!(
-                        "verify environmental after cycle {cycles}\n{}",
-                        verify::tail_bytes(diagnostics, DETAIL_TAIL),
-                    ),
-                )?;
-                break;
-            }
+            println!("  verify: FAIL (cause={cause}) — sending the fixer");
             let mut next = vec![format!(
                 "VERIFY FAILED (cause: {cause}). Diagnostics from the failed check:\n{}",
                 verify::tail_bytes(diagnostics, DETAIL_TAIL),
@@ -886,11 +1062,9 @@ impl Engine {
             if !last_verify_ok {
                 commit::reset_worktree(&self.repo)?;
             }
-            self.finish_done(state, &slug, &findings, &last_hash, env_parked)
+            self.finish_done(state, &slug, &findings, &last_hash)
         } else {
-            let why = if env_parked {
-                "verify failed for environmental reasons (not counted as a fix cycle)".to_string()
-            } else if findings.is_empty() {
+            let why = if findings.is_empty() {
                 "fix cycles exhausted but verify never passed".to_string()
             } else {
                 format!(
@@ -908,7 +1082,6 @@ impl Engine {
         slug: &str,
         leftover: &[String],
         last_hash: &str,
-        env_parked: bool,
     ) -> Result<()> {
         self.write_findings_file(slug, leftover)?;
         state.set_findings(slug, leftover.len())?;
@@ -918,16 +1091,6 @@ impl Engine {
             } else {
                 format!("fixed + committed {last_hash}")
             }
-        } else if env_parked {
-            format!(
-                "kept last green{}; {} still open (environmental verify)",
-                if last_hash.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {last_hash}")
-                },
-                leftover.len()
-            )
         } else {
             format!(
                 "kept last green{}; {} still open after confirm",
@@ -967,8 +1130,9 @@ impl Engine {
         if h.is_empty() { Ok(None) } else { Ok(Some(h)) }
     }
 
-    /// Wipe the worktree and park the component in Failed. Reset is fatal:
-    /// a leftover dirty tree would leak into the next component's commit.
+    /// Wipe the worktree and park the component in Failed. Only called
+    /// after the attempt budget is spent. Reset is fatal: a leftover
+    /// dirty tree would leak into the next component's commit.
     fn quarantine(&self, state: &mut State, slug: &str, why: &str) -> Result<()> {
         commit::reset_worktree(&self.repo)?;
         state.set_detail(slug, why)?;
@@ -991,7 +1155,8 @@ impl Engine {
         ];
         // 100 turns (was 60): a large component review legitimately reads
         // many files; 60 proved too tight and the run died turn-capped
-        // with no final JSON. The wall-clock timeout still bounds it.
+        // with no final JSON. Turns, not wall-clock: there is no default
+        // goose duration cap.
         let outcome = goose::run_recipe(&self.repo, &recipe, &params, Some(100))?;
         self.record_usage(slug, &outcome.usage);
         parse_findings(&outcome.result)
@@ -1106,7 +1271,8 @@ impl Engine {
         self.review_dir.join("findings").join(format!("{safe}.txt"))
     }
 
-    /// Retry an environmental failure once. Does not send the fixer.
+    /// Retry an environmental / stall failure once. Still red after that
+    /// is a fix work order — a red check means repair, not park.
     fn verify_until_stable(&self, state: &State, slug: &str) -> Result<VerifyVerdict> {
         let first = self.verify_component(state, slug)?;
         if first.passed || first.cause.as_deref() != Some("environmental") {
@@ -1114,28 +1280,39 @@ impl Engine {
         }
         println!("  verify: FAIL (environmental) — retrying once");
         let second = self.verify_component(state, slug)?;
-        if !second.passed && second.cause.as_deref() == Some("environmental") {
-            println!("  verify: still environmental");
+        if second.passed {
+            return Ok(second);
+        }
+        if second.cause.as_deref() == Some("environmental") {
+            println!("  verify: still failing after retry — sending the fixer");
+            return Ok(VerifyVerdict {
+                passed: false,
+                cause: Some("fix".to_string()),
+                diagnostics: second.diagnostics,
+            });
         }
         Ok(second)
     }
 
-    /// Scoped check first (e.g. `go test ./pkg`), then the full configured
-    /// suite — at most ONE full-suite run: `run_scoped` reports whether it
-    /// derived a scoped command, so a non-Go repo (or paths that map to no
-    /// packages) runs the full suite exactly once instead of twice.
-    /// Pass/fail is the exit code; the recipe only classifies failures.
+    /// Per-component commands from the checklist first (discovered), then
+    /// the repo-wide `verify` list. Missing per-component commands → the
+    /// repo list once. Pass/fail is the exit code; the recipe only
+    /// classifies failures.
     fn verify_component(&self, state: &State, slug: &str) -> Result<VerifyVerdict> {
-        let paths = self.component_paths_vec(state, slug);
-        let harness = match verify::run_scoped(&self.repo, &paths)? {
-            Some(scoped) if scoped.passed => {
+        let per = state
+            .get(slug)
+            .map(|c| c.verify.clone())
+            .unwrap_or_default();
+        let harness = if per.is_empty() {
+            verify::run(&self.repo)?
+        } else {
+            let scoped = verify::run_list(&self.repo, &per)?;
+            if scoped.passed {
                 let full = verify::run(&self.repo)?;
                 if full.passed { scoped } else { full }
+            } else {
+                scoped
             }
-            // Scoped failed → red already; don't burn a second full run.
-            Some(scoped) => scoped,
-            // No scoped derivation (non-Go repo / unmapped paths) → full once.
-            None => verify::run(&self.repo)?,
         };
         if harness.passed {
             return Ok(VerifyVerdict {
@@ -1147,6 +1324,17 @@ impl Engine {
         let mut diagnostics = harness.output;
         if let Some(cmd) = &harness.failed_command {
             diagnostics = format!("command `{cmd}` failed\n{diagnostics}");
+        }
+        // Stall (and optional wall-clock timeout) are harness facts, not
+        // fixer bugs — skip the classifier so we do not burn a fix cycle.
+        if harness.kill.is_some() {
+            let diag_file = self.review_dir.join("verify-diagnostics.txt");
+            let _ = std::fs::write(&diag_file, &diagnostics);
+            return Ok(VerifyVerdict {
+                passed: false,
+                cause: Some("environmental".to_string()),
+                diagnostics: Some(diagnostics),
+            });
         }
         let name = self
             .component_name(state, slug)
@@ -1262,6 +1450,171 @@ fn resolve_src_paths(repo: &Path, slug: &str) -> String {
     resolve_src_paths_vec(repo, slug).join(", ")
 }
 
+/// Classifier result for a red full-suite gate.
+struct GateClass {
+    cause: String,
+    component: String,
+    diagnostics: String,
+}
+
+fn parse_gate_class(result: &Value, fallback_diag: &str) -> GateClass {
+    let raw_cause = field(result, "cause").unwrap_or("fix").trim();
+    let cause = if raw_cause.eq_ignore_ascii_case("environmental") {
+        "environmental"
+    } else {
+        "fix"
+    };
+    let component = field(result, "component")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let diagnostics = field(result, "diagnostics")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback_diag.to_string());
+    GateClass {
+        cause: cause.to_string(),
+        component,
+        diagnostics,
+    }
+}
+
+/// Prefer the classifier's slug when it is a real component; otherwise
+/// the longest catalog path that appears in the diagnostics; otherwise
+/// a synthetic slug so the fixer still runs.
+fn resolve_gate_component(state: &State, suggested: &str, diagnostics: &str) -> String {
+    if state.components.contains_key(suggested) {
+        return suggested.to_string();
+    }
+    match_component_from_diagnostics(state, diagnostics).unwrap_or_else(|| "final-gate".to_string())
+}
+
+/// Longest component path (then slug) that appears as a substring of
+/// `diagnostics`. Language-agnostic: just string contains.
+fn match_component_from_diagnostics(state: &State, diagnostics: &str) -> Option<String> {
+    let mut best: Option<(usize, &str, &str)> = None;
+    for c in state.components.values() {
+        for p in &c.paths {
+            let p = p.trim().trim_end_matches('/');
+            if p.is_empty() {
+                continue;
+            }
+            if diagnostics.contains(p) {
+                let score = p.len();
+                let take = match best {
+                    None => true,
+                    Some((s, slug, _)) => score > s || (score == s && c.slug.as_str() < slug),
+                };
+                if take {
+                    best = Some((score, c.slug.as_str(), p));
+                }
+            }
+        }
+    }
+    best.map(|(_, slug, _)| slug.to_string())
+}
+
+fn write_component_catalog(review_dir: &Path, state: &State) -> Result<PathBuf> {
+    let path = review_dir.join("gate-components.txt");
+    let mut body = String::from(
+        "# slug | name | phase | verify | paths\n\
+         # Pick the slug whose paths own the failing file.\n",
+    );
+    for c in state.components.values() {
+        let verify = if c.verify.is_empty() {
+            "(repo verify list)".to_string()
+        } else {
+            c.verify.join("; ")
+        };
+        let paths = if c.paths.is_empty() {
+            "(none)".to_string()
+        } else {
+            c.paths.join(", ")
+        };
+        body.push_str(&format!(
+            "{} | {} | {} | {} | {}\n",
+            c.slug,
+            c.name,
+            c.phase.as_str(),
+            verify,
+            paths
+        ));
+    }
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+/// Verify-script edits that are **not** this component's files.
+/// Changing a gate file you own is the review; changing one you don't is
+/// rewriting the exam.
+fn gate_edits_outside_component(repo: &Path, owned: &[String]) -> Result<Vec<String>> {
+    let gates = verify::gate_files(repo);
+    if gates.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(commit::dirty_paths(repo)?
+        .into_iter()
+        .filter(|p| gates.iter().any(|g| p == g))
+        .filter(|p| !path_in_component(p, owned))
+        .collect())
+}
+
+fn path_in_component(path: &str, owned: &[String]) -> bool {
+    owned.iter().any(|root| {
+        let root = root.trim().trim_end_matches('/');
+        !root.is_empty() && (path == root || path.starts_with(&format!("{root}/")))
+    })
+}
+
+fn gate_finding(gate: &verify::RunResult, diagnostics: &str) -> String {
+    let cmd = gate.failed_command.clone().unwrap_or_default();
+    format!(
+        "FULL-SUITE VERIFY FAILED (command: `{cmd}`). This is the work — \
+         make this command pass. Do not dismiss it as pre-existing or out of \
+         scope; the per-component check already passed and missed it.\n\
+         Full command output is in .review/verify-diagnostics.txt — open it.\n\n{}",
+        verify::tail_bytes(diagnostics, DETAIL_TAIL)
+    )
+}
+
+/// Write `.review/verify-diagnostics.txt` from a final-gate result so a
+/// red run is inspectable. Per-cycle verify already writes this file;
+/// the full gate used to drop its output on the floor.
+fn read_optional(path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(path).ok()
+}
+
+fn restore_optional(path: &Path, prior: Option<&[u8]>) {
+    match prior {
+        Some(bytes) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn persist_final_diagnostics(
+    review_dir: &std::path::Path,
+    result: &verify::RunResult,
+) -> std::path::PathBuf {
+    let path = review_dir.join("verify-diagnostics.txt");
+    let mut body = result.output.clone();
+    if let Some(cmd) = &result.failed_command {
+        body = format!("command `{cmd}` failed\n{body}");
+    }
+    if let Err(e) = std::fs::write(&path, &body) {
+        eprintln!("  warning: failed to write {}: {e}", path.display());
+    }
+    path
+}
+
 /// Parse findings from the review recipe's final JSON.
 ///   {"findings": ["...", "..."]}   (empty array = clean)
 /// Missing key / null / unexpected shapes are sentinel review errors.
@@ -1286,9 +1639,9 @@ fn parse_findings(result: &Value) -> Result<Vec<String>> {
         }
         Some(Value::Null) | Some(Value::String(_)) => {
             eprintln!("  review: findings value is null/empty-string, flagging as review error");
-            Ok(vec![format!(
-                "review result was malformed (findings value was null or empty-string, expected an array)"
-            )])
+            Ok(vec![
+                "review result was malformed (findings value was null or empty-string, expected an array)".to_string(),
+            ])
         }
         Some(other) => {
             eprintln!("  review: unexpected findings shape ({other}), flagging as review error");
@@ -1334,7 +1687,6 @@ pub fn init(
     std::fs::create_dir_all(review.join("findings"))?;
     recipes::ensure_config(repo)?;
     recipes::ensure_gitignore(repo)?;
-    warn_repo_holes(repo);
 
     if !components.is_empty() {
         let list: Vec<Component> = components
@@ -1375,8 +1727,13 @@ pub fn init(
     });
     std::fs::write(&existing_path, existing_text)?;
     let discovered = discover::discover(repo, &project, &existing_path)?;
-    println!("  discovered {} component(s):", discovered.len());
-    for c in &discovered {
+    let proposal = review.join("discovery-proposal.json");
+    discover::write_proposal(&proposal, &discovered)?;
+    println!("  validating discovery…");
+    let discovered = discover::validate(repo, &project, &proposal, discovered)?;
+    recipes::apply_discovered_gates(repo, &discovered.verify, &discovered.final_verify)?;
+    println!("  discovered {} component(s):", discovered.components.len());
+    for c in &discovered.components {
         println!(
             "    {:<24} {:<6} pri={:<4} {}",
             c.slug, c.tier, c.priority, c.name
@@ -1384,10 +1741,12 @@ pub fn init(
     }
 
     let list: Vec<Component> = discovered
+        .components
         .iter()
         .map(|c| {
             let mut comp = Component::new(&c.slug, &c.name, &c.tier);
             comp.paths = c.paths.clone();
+            comp.verify = c.verify.clone();
             comp
         })
         .collect();
@@ -1402,7 +1761,7 @@ pub fn init(
         "-",
         "initialized (ai-discovery)",
     )?;
-    Ok(discovered)
+    Ok(discovered.components)
 }
 
 fn checklist_from_state(state: &State, list: &[Component]) -> Vec<Component> {
@@ -1415,36 +1774,6 @@ fn checklist_from_state(state: &State, list: &[Component]) -> Vec<Component> {
             out
         })
         .collect()
-}
-
-fn warn_repo_holes(repo: &Path) {
-    let cmd = repo.join("cmd");
-    let Ok(entries) = std::fs::read_dir(&cmd) else {
-        return;
-    };
-    for ent in entries.flatten() {
-        let p = ent.path();
-        if !p.is_dir() {
-            continue;
-        }
-        let has_src = std::fs::read_dir(&p)
-            .map(|it| {
-                it.flatten().any(|e| {
-                    matches!(
-                        e.path().extension().and_then(|x| x.to_str()),
-                        Some("go") | Some("rs")
-                    )
-                })
-            })
-            .unwrap_or(false);
-        if !has_src {
-            let rel = p.strip_prefix(repo).unwrap_or(&p);
-            eprintln!(
-                "  warning: {} has no source files (empty command package)",
-                rel.display()
-            );
-        }
-    }
 }
 
 fn warn_missing_paths(repo: &Path, list: &[Component]) {
@@ -1606,6 +1935,7 @@ fn persist_checklist(review_dir: &Path, state: &State) -> Result<()> {
             if !st.paths.is_empty() {
                 c.paths = st.paths.clone();
             }
+            c.verify = st.verify.clone();
         }
     }
     checklist::save(&path, &comps)
@@ -1614,11 +1944,12 @@ fn persist_checklist(review_dir: &Path, state: &State) -> Result<()> {
 /// Requeue quarantined (Failed) components back to Pending so the next
 /// `gaggle run` retries them (CLI `gaggle requeue <slug>… | --all`).
 ///
-/// Only Failed components are eligible: requeueing a Done component is a
-/// checklist-uncheck operation (sync already handles that), and touching
-/// an active-phase component would fight the running engine. Quarantine
-/// detail is moved to a `previously:` prefix rather than discarded, so
-/// the retry's history stays visible in `gaggle list`.
+/// Only Failed components are eligible here. Unchecking a component in
+/// the checklist also requeues Done *and* Failed rows on the next
+/// `gaggle run` (see `State::sync`). Touching an active-phase component
+/// would fight the running engine. Quarantine detail is moved to a
+/// `previously:` prefix rather than discarded, so the retry's history
+/// stays visible in `gaggle list`.
 pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> {
     let review_dir = repo.join(crate::REVIEW_DIR);
     let state_path = review_dir.join("state.json");
@@ -1718,6 +2049,17 @@ mod tests {
     }
 
     #[test]
+    fn component_owns_its_own_gate_script() {
+        let owned = vec![
+            "scripts/verify-artifacts.sh".into(),
+            ".github/workflows".into(),
+        ];
+        assert!(path_in_component("scripts/verify-artifacts.sh", &owned));
+        assert!(path_in_component(".github/workflows/ci.yml", &owned));
+        assert!(!path_in_component("src/main.rs", &owned));
+    }
+
+    #[test]
     fn missing_still_open_is_empty() {
         let v = json!({"status": "ok"});
         assert!(parse_still_open(&v).unwrap().is_empty());
@@ -1732,5 +2074,64 @@ mod tests {
         assert_eq!(p.file_name().unwrap(), "___evil.txt");
         let p = engine.findings_path("loop-engine");
         assert_eq!(p.file_name().unwrap(), "loop-engine.txt");
+    }
+
+    #[test]
+    fn gate_class_defaults_unknown_cause_to_fix() {
+        let v = json!({"cause": "maybe", "component": "db", "diagnostics": "boom"});
+        let g = parse_gate_class(&v, "fallback");
+        assert_eq!(g.cause, "fix");
+        assert_eq!(g.component, "db");
+        assert_eq!(g.diagnostics, "boom");
+    }
+
+    #[test]
+    fn gate_class_accepts_environmental() {
+        let v = json!({"cause": "environmental", "component": "cli"});
+        let g = parse_gate_class(&v, "fallback");
+        assert_eq!(g.cause, "environmental");
+        assert_eq!(g.component, "cli");
+        assert_eq!(g.diagnostics, "fallback");
+    }
+
+    #[test]
+    fn match_picks_longest_path_in_diagnostics() {
+        let mut s = State::default();
+        s.sync(&[
+            Component {
+                slug: "db".into(),
+                name: "DB".into(),
+                tier: "high".into(),
+                done: true,
+                paths: vec!["crates/oxllm-db".into()],
+                verify: vec![],
+            },
+            Component {
+                slug: "server-pipeline".into(),
+                name: "Pipeline".into(),
+                tier: "high".into(),
+                done: true,
+                paths: vec![
+                    "crates/oxllm-server/src/pipeline".into(),
+                    "crates/oxllm-server/src/spend_writer.rs".into(),
+                ],
+                verify: vec!["cargo test -p oxllm-server".into()],
+            },
+        ]);
+        let diag = "panicked at crates/oxllm-server/src/spend_writer.rs:882: \
+                    no such column: end_user_id";
+        assert_eq!(
+            match_component_from_diagnostics(&s, diag).as_deref(),
+            Some("server-pipeline")
+        );
+        assert_eq!(
+            resolve_gate_component(&s, "not-a-slug", diag),
+            "server-pipeline"
+        );
+        assert_eq!(resolve_gate_component(&s, "db", diag), "db");
+        assert_eq!(
+            resolve_gate_component(&s, "", "nothing matches"),
+            "final-gate"
+        );
     }
 }

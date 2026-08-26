@@ -222,34 +222,28 @@ pub fn dirty_paths(repo: &Path) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// Stage `paths` and commit. Returns the short hash, or Ok("") if nothing
-/// was staged. Refuses an empty path list so we never `git add -A`.
-pub fn commit_paths(repo: &Path, message: &str, paths: &[&str]) -> Result<String> {
+/// Best-effort `git reset -- path`. Used to drop harness files from the
+/// index after a blanket `git add -A`. Failure is ignored: the path may
+/// not be staged.
+fn unstage(repo: &Path, path: &str) {
+    let _ = git_cmd(repo, &["reset", "--quiet", "--", path]).output();
+}
+
+/// Commit whatever the worktree currently has dirty. Used after a fix that
+/// started from a clean tree, so the dirty set is this component's edits
+/// (adds, edits, and deletions). `git add -A` stages all of that; a
+/// vanished file is a deletion, not a pathspec error.
+///
+/// `.review/` is never part of the commit (gitignore plus an unstage, so
+/// already-tracked checklist/config files cannot sneak in). Harness-authored
+/// `.gitignore` edits are also left out of the product commit.
+pub fn commit_dirty(repo: &Path, message: &str) -> Result<String> {
+    git(repo, &["add", "-A"])?;
+    unstage(repo, ".review");
+    unstage(repo, ".gitignore");
+
     let cfg = CommitConfig::load(repo)?;
-    if paths.is_empty() {
-        bail!(
-            "cannot commit with unknown scope: no component paths resolved (refusing to stage the entire worktree)"
-        );
-    }
-    // `:(literal)` pathspec magic on every path: a plain pathspec containing
-    // glob metacharacters is fnmatched (e.g. `a[1].rs` also stages `a1.rs`),
-    // and a leading `:` is parsed as pathspec magic — both silently widen
-    // the commit scope beyond this component.
-    let literal: Vec<String> = paths.iter().map(|p| format!(":(literal){p}")).collect();
-    let literal_refs: Vec<&str> = literal.iter().map(String::as_str).collect();
-    let mut add_args: Vec<&str> = vec!["add", "--"];
-    add_args.extend(&literal_refs);
-    git(repo, &add_args)?;
-    // Scoped emptiness check AND scoped commit: the index-global forms
-    // (`git diff --cached --quiet`, `git commit -m`) would sweep up
-    // unrelated already-staged changes under this component's message.
-    // `--quiet` exits 0 = empty, 1 = has staged diff; 128/129 are REAL git
-    // errors that must not be treated as "not empty" (the old
-    // `.status.success()` inversion did exactly that and marched on to
-    // commit).
-    let mut quiet_args: Vec<&str> = vec!["diff", "--cached", "--quiet", "--"];
-    quiet_args.extend(&literal_refs);
-    let probe = git_cmd(repo, &quiet_args)
+    let probe = git_cmd(repo, &["diff", "--cached", "--quiet"])
         .output()
         .with_context(|| "failed to check staged diff")?;
     match probe.status.code() {
@@ -261,53 +255,21 @@ pub fn commit_paths(repo: &Path, message: &str, paths: &[&str]) -> Result<String
             String::from_utf8_lossy(&probe.stderr).trim()
         ),
     }
-    let mut commit_args: Vec<&str> = if cfg.sign {
-        vec!["commit", "--only", "-m", message, "--"]
+    let commit_args: Vec<&str> = if cfg.sign {
+        vec!["commit", "-m", message]
     } else {
-        vec![
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--only",
-            "-m",
-            message,
-            "--",
-        ]
+        vec!["-c", "commit.gpgsign=false", "commit", "-m", message]
     };
-    commit_args.extend(&literal_refs);
     git(repo, &commit_args)?;
     git(repo, &["rev-parse", "--short", "HEAD"])
-}
-
-/// Commit whatever the worktree currently has dirty. Used after a fix that
-/// started from a clean tree, so the dirty set is this component's edits.
-///
-/// Harness-authored `.gitignore` edits (ensure_gitignore appends the
-/// `.review` block at run start) are EXCLUDED: without this, the first
-/// green component sweeps the .gitignore change into its "fix review
-/// findings" commit — a spurious, misattributed commit. The edit stays in
-/// the working tree for the user to commit (or the run-start dirty guard,
-/// which exempts it, tolerates it indefinitely).
-pub fn commit_dirty(repo: &Path, message: &str) -> Result<String> {
-    let paths: Vec<String> = dirty_paths(repo)?
-        .into_iter()
-        .filter(|p| p != ".gitignore")
-        .collect();
-    if paths.is_empty() {
-        return Ok(String::new());
-    }
-    let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    commit_paths(repo, message, &refs)
 }
 
 /// Reset the entire worktree: unstage, drop untracked files/dirs, discard
 /// tracked modifications. Gitignored files are left alone.
 ///
-/// `.review/` is exempt from `git clean` (its untracked-but-negated
-/// entries — config.toml, checklist.md, workflows/ — are user-authored
-/// and must survive a reset), and `.gitignore` is exempt from the tracked
-/// discard (ensure_gitignore may have appended our block this run;
-/// reverting it would re-expose `.review` state files to a later clean).
+/// `.review/` is exempt from `git clean` (harness state must survive a
+/// reset), and `.gitignore` is exempt from the tracked discard
+/// (ensure_gitignore may have appended our block this run).
 pub fn reset_worktree(repo: &Path) -> Result<()> {
     git(repo, &["reset", "--quiet", "--", "."])?;
     // Clean first: `checkout -- .` fails on leftover untracked files.
@@ -381,5 +343,53 @@ mod tests {
         // Line form (kept for reference/debugging); is_dirty itself uses -z.
         let line = |s: &str| s.get(3..).unwrap_or("").to_string();
         assert_eq!(line(" M src/foo.rs"), "src/foo.rs");
+    }
+
+    #[test]
+    fn commit_dirty_stages_deletions_and_skips_review_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "gaggle-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "a\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "b\n").unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        git(&dir, &["config", "user.email", "gaggle@test"]).unwrap();
+        git(&dir, &["config", "user.name", "gaggle"]).unwrap();
+        git(&dir, &["add", "-A"]).unwrap();
+        git(
+            &dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        )
+        .unwrap();
+
+        std::fs::remove_file(dir.join("src/b.rs")).unwrap();
+        std::fs::write(dir.join("src/c.rs"), "c\n").unwrap();
+        std::fs::create_dir_all(dir.join(".review")).unwrap();
+        std::fs::write(dir.join(".review/checklist.md"), "nope\n").unwrap();
+
+        let hash = commit_dirty(&dir, "fix").unwrap();
+        assert!(!hash.is_empty(), "expected a commit hash");
+
+        let names = git(
+            &dir,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        )
+        .unwrap();
+        assert!(names.contains("src/c.rs"), "{names}");
+        assert!(
+            names.contains("src/b.rs"),
+            "deletion should be in the commit: {names}"
+        );
+        assert!(
+            !names.contains(".review"),
+            "harness files must not be committed: {names}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -21,6 +21,12 @@ instructions: |
   The component's code lives at the paths above. Open and read each file
   line by line BEFORE deciding. Do not review from memory or guesswork.
 
+  DOCS: also open README / docs / architecture notes that describe this
+  component. Use them as reference for intended behavior. If the code and
+  the docs disagree, or the docs are stale, broken, or would send a
+  reader the wrong way, that is a finding (name the doc file). Docs are
+  not a separate component — they travel with this one.
+
   Your job: review the component's code for real, actionable issues:
   - Correctness bugs (off-by-one, wrong conditions, edge cases)
   - Logic errors that would fail under realistic inputs
@@ -36,6 +42,7 @@ instructions: |
 
   RULES:
   - Read the actual code for this component before judging.
+  - Read the related docs before judging intended behavior.
   - Each finding must be SPECIFIC: name the file, the function, the exact
     problem, and a concrete fix. Vague or cosmetic findings are noise.
   - If the component is genuinely fine, report an EMPTY findings list.

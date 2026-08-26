@@ -1,0 +1,75 @@
+# =============================================================================
+# gate — FULL-SUITE VERIFY failure (gaggle)
+# The harness already ran `final_verify` (or the repo `verify` list) after
+# every component finished. It FAILED. This agent does two things:
+#   1. pick the component that owns the failing code/test
+#   2. classify cause (fix vs environmental) and restate diagnostics
+# It cannot mark the gate as passed. The harness then sends the fixer
+# and re-runs the full suite — a red gate is a work order, not a stop.
+#
+# Ends with one JSON line the harness parses:
+#   {"cause": "fix|environmental", "component": "<slug>", "diagnostics": "..."}
+#
+# Model: NOT pinned here — the harness driver pins provider/model from
+# .review/config.toml when set, else goose uses its configured default.
+# (A repo override in .review/workflows/ may pin via settings: itself.)
+# =============================================================================
+version: 1.0.0
+id: gate
+title: "Classify full-suite verify failure"
+description: Picks the owning component and judges why the end-of-run gate failed
+instructions: |
+  The full-suite verify gate FAILED after every component's own check
+  passed. That is expected sometimes: the per-component command can miss
+  tests (optional features, workspace unification, integration suites).
+  A red full gate is still work this run must finish. Do not treat it as
+  "already reviewed, move on".
+
+  Do NOT re-run the test suite or build. Read the diagnostics and the
+  component catalog.
+
+  Diagnostics from the failing command are in:
+  {{diagnostics_file}}
+  (Open that file and read it.)
+
+  Components in this run (slug, name, paths, the scoped verify that
+  already passed) are listed in:
+  {{components_file}}
+  (Open that file and read it.)
+
+  ## Pick the component
+  Choose the catalog slug whose `paths` own the failing file, test, or
+  the code that must change. Prefer the longest/most specific path match.
+  If a test in A asserts against code in B, pick whichever side the
+  diagnostics say is wrong. If nothing matches, pick the closest slug
+  and say so in diagnostics — the harness still needs a slug.
+
+  ## Judgment
+  Decide the CAUSE:
+  - **fix**: the failing command's output names a real product or test
+    problem (compile error, assertion, missing column, wrong fixture,
+    a test the scoped command never executed). THIS IS THE COMMON CASE.
+    "The scoped verify passed" or "this test looks pre-existing" is NOT
+    environmental — those are exactly why the full gate exists. The
+    fixer must make the command pass.
+  - **environmental**: the failure is NOT a code or test bug (missing
+    toolchain, network, auth, a hung command the harness already
+    classified as a stall). Rare — call this only with evidence that
+    no code change in this repo would make the command pass.
+
+  ## Report
+  End with EXACTLY ONE JSON line — nothing after it:
+  {"cause": "fix|environmental", "component": "<slug from the catalog>", "diagnostics": "<failing file:line, error, and what to change, max ~4KB>"}
+prompt: "The full-suite verify failed. Pick the owning component from the catalog and classify the failure; end with one JSON line: {\"cause\": \"fix|environmental\", \"component\": \"<slug>\", \"diagnostics\": \"...\"}"
+parameters:
+  - key: diagnostics_file
+    input_type: string
+    requirement: required
+    description: Path to the harness-captured full-suite verify output
+  - key: components_file
+    input_type: string
+    requirement: required
+    description: Path to the catalog of components (slug, paths, scoped verify)
+extensions:
+  - type: builtin
+    name: developer

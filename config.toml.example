@@ -1,10 +1,13 @@
 # gaggle repo config — copied into .review/ by the harness or hand-written.
-# `gaggle init` detects go.mod / Cargo.toml / package.json / pytest and writes
-# matching verify commands; this file is the Rust default.
+# `gaggle init` writes this template; discovery fills `verify` / `final_verify`
+# from how THIS repo actually tests (CI, README, Makefile — whatever it uses).
 # verify commands run after every fix; the fix is only committed if all pass.
+# Per-component commands live on the checklist (`verify:` lines, written
+# by discovery). When a component has those, the harness runs them first,
+# then this list.
 #
 # Optional recipe overrides live in .review/workflows/<name>.yaml
-# (discover/review/confirm/fix/verify/report). Missing names use the baked-in copy.
+# (discover/discover-validate/review/confirm/fix/verify/gate/report). Missing names use the baked-in copy.
 #
 # Each entry is passed verbatim to a shell interpreter (`sh -c` on Unix,
 # `cmd /C` on Windows), so shell metacharacters like `$`, backticks, and
@@ -21,8 +24,7 @@
 # one config applies on both Unix and Windows. To avoid shell-divergence
 # bugs in mixed-platform repos, prefer entries that are valid verbatim in
 # BOTH `sh` and `cmd.exe`. The safe building blocks are:
-#   • bare `cargo` subcommands (cargo build, cargo test, cargo clippy)
-#     that need no shell metacharacters;
+#   • bare commands that need no shell metacharacters;
 #   • `&&` to chain commands conditionally (same meaning in both shells);
 #   • avoid `&` (backgrounds on Unix, sequences on Windows), `$`/backticks
 #     (Unix-only), and `%VAR%` (Windows-only).
@@ -31,14 +33,33 @@
 # config.unix.toml / config.win.toml copied into place) rather than
 # relying on a single fragile entry.
 
-verify = ["cargo build", "cargo test"]
+# Placeholder until discovery copies the repo's real project-wide gate.
+# `false` fails closed so a run cannot fake green.
+verify = ["false"]
 
-# Optional extra-slow gate, run ONCE at the end of `gaggle run` (not per
-# fix cycle). Per cycle the harness runs a scoped check when it can
-# derive one (`go test ./pkg`, `cargo test -p crate`), then this file's
-# `verify` list. Put suites too slow for that (e2e, 10+ minutes) here.
-# When unset, the regular `verify` list is run once more at run end.
-# final_verify = ["cargo build --workspace", "cargo test --workspace"]
+# Optional extra-slow gate, run at the end of `gaggle run` (not per
+# fix cycle). Per cycle the harness runs the component's `verify:`
+# command(s) from the checklist, then this file's `verify` list. Put
+# suites too slow for that (e2e, 10+ minutes) here. When unset, the
+# regular `verify` list is run once more at run end.
+# A red full gate does NOT stop the run: the harness classifies the
+# owning component, sends the fixer, and re-runs this list (same 3-cycle
+# budget as a component). Only after that budget is spent is the process
+# exit red.
+# final_verify = ["./scripts/e2e.sh"]
+
+# Seconds of no output AND no CPU before a verify command is treated as
+# hung (stuck prompt, deadlock, a connect that never returns). Default
+# 900. A 4-hour compile that keeps printing or burning CPU is fine.
+# `0` disables. Env `GAGGLE_VERIFY_STALL_SECS` wins. Must sit before any
+# [section] header.
+# verify_stall_secs = 900
+
+# Optional wall-clock ceiling for ONE verify command, in seconds. Unset
+# means none — duration is not the thing we police. Last-resort CI budget,
+# not hang prevention. Env `GAGGLE_VERIFY_TIMEOUT_SECS` wins (`0` disables).
+# Must sit before any [section] header.
+# verify_timeout_secs = 14400
 
 # Agent model (optional). When set, the harness exports these as
 # GOOSE_PROVIDER / GOOSE_MODEL for every recipe run, overriding goose's

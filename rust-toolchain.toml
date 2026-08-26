@@ -1,0 +1,6 @@
+# Same channel as CI: `uses: dtolnay/rust-toolchain@stable` (the @stable
+# there is the rustup channel, not a GitHub Action branch). rustup will
+# install/update this toolchain when you enter the repo.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

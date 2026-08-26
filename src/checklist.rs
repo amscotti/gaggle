@@ -8,6 +8,7 @@
 //! ## high
 //! - [ ] my-slug — Human Name
 //!   paths: src/foo.rs, src/foo/
+//!   verify: <the command this repo uses to check this slice>
 //! - [x] done-slug — Already Done
 //!   paths: src/done.rs
 //! ```
@@ -24,6 +25,10 @@ pub struct Component {
     pub tier: String,
     pub done: bool,
     pub paths: Vec<String>,
+    /// Optional per-component verify commands (discovered). Empty = use
+    /// the repo-wide `verify` list from `.review/config.toml`.
+    #[serde(default)]
+    pub verify: Vec<String>,
 }
 
 impl Component {
@@ -34,17 +39,78 @@ impl Component {
             tier: tier.to_lowercase(),
             done: false,
             paths: Vec::new(),
+            verify: Vec::new(),
+        }
+    }
+}
+
+/// Review priority band. Unknown strings parse as Medium.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    High,
+    Medium,
+    Low,
+}
+
+impl Tier {
+    pub const ALL: &[Tier] = &[Tier::High, Tier::Medium, Tier::Low];
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "high" => Self::High,
+            "low" => Self::Low,
+            _ => Self::Medium,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    /// Sort key: 0 = highest priority.
+    pub const fn rank(self) -> usize {
+        match self {
+            Self::High => 0,
+            Self::Medium => 1,
+            Self::Low => 2,
+        }
+    }
+
+    /// High is stronger than Medium is stronger than Low.
+    pub fn is_stronger_than(self, other: Self) -> bool {
+        self.rank() < other.rank()
+    }
+
+    /// Priority floor when the agent omitted an explicit integer.
+    pub fn default_priority(self) -> u32 {
+        match self {
+            Self::High => 100,
+            Self::Medium => 50,
+            Self::Low => 10,
         }
     }
 }
 
 /// Known tiers in priority order (highest first).
-pub const TIERS: &[&str] = &["high", "medium", "low"];
+pub const TIERS: &[&str] = &[
+    Tier::High.as_str(),
+    Tier::Medium.as_str(),
+    Tier::Low.as_str(),
+];
 
 /// Shared ranking of a tier string. Known tiers are ranked by priority
 /// (0 = highest); unknown tiers sort last.
 pub fn tier_rank(tier: &str) -> usize {
-    TIERS.iter().position(|t| *t == tier).unwrap_or(TIERS.len())
+    match tier {
+        "high" => Tier::High.rank(),
+        "medium" => Tier::Medium.rank(),
+        "low" => Tier::Low.rank(),
+        _ => Tier::ALL.len(),
+    }
 }
 
 /// Parse a markdown checklist into components. H2 headings are tiers.
@@ -82,6 +148,19 @@ pub fn parse(text: &str) -> Result<Vec<Component>> {
                 }
             } else {
                 eprintln!("  ⚠ checklist: orphan `paths:` line ignored: {t}");
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("verify:") {
+            let cmd = rest.trim();
+            if have_current {
+                if !cmd.is_empty() {
+                    if let Some(last) = items.last_mut() {
+                        last.verify.push(cmd.to_string());
+                    }
+                }
+            } else {
+                eprintln!("  ⚠ checklist: orphan `verify:` line ignored: {t}");
             }
             continue;
         }
@@ -130,6 +209,7 @@ pub fn parse(text: &str) -> Result<Vec<Component>> {
                 tier: tier.clone(),
                 done,
                 paths: Vec::new(),
+                verify: Vec::new(),
             });
             have_current = true;
             continue;
@@ -186,6 +266,14 @@ pub fn render(components: &[Component]) -> Result<String> {
                 );
             }
         }
+        for v in &c.verify {
+            if v.contains(['\n', '\r']) {
+                bail!(
+                    "component `{}` has a verify command with a newline: {v:?}",
+                    c.slug
+                );
+            }
+        }
     }
     let mut out = String::from("# Checklist\n");
     let mut tiers: Vec<String> = Vec::new();
@@ -211,6 +299,9 @@ pub fn render(components: &[Component]) -> Result<String> {
             }
             if !c.paths.is_empty() {
                 out.push_str(&format!("  paths: {}\n", c.paths.join(", ")));
+            }
+            for v in &c.verify {
+                out.push_str(&format!("  verify: {v}\n"));
             }
         }
     }
@@ -287,6 +378,17 @@ mod tests {
         let c = parse(md).unwrap();
         assert!(!c[0].done);
         assert!(c[0].paths.is_empty());
+        assert!(c[0].verify.is_empty());
+    }
+
+    #[test]
+    fn parse_verify_lines_roundtrip() {
+        let md = "# Checklist\n\n## high\n- [ ] db — Database\n  paths: crates/db\n  verify: go test ./db\n  verify: go vet ./db\n";
+        let c = parse(md).unwrap();
+        assert_eq!(c[0].verify, vec!["go test ./db", "go vet ./db"]);
+        let out = render(&c).unwrap();
+        let again = parse(&out).unwrap();
+        assert_eq!(again[0].verify, c[0].verify);
     }
 }
 

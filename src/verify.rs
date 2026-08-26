@@ -5,12 +5,32 @@ use anyhow::Context;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// Why the harness killed a still-running verify command.
+#[derive(Debug, Clone)]
+pub enum VerifyKill {
+    /// No stdout/stderr bytes and no process-group CPU for `idle`.
+    Stall { idle: Duration },
+    /// Optional wall-clock ceiling (`verify_timeout_secs`) elapsed.
+    Timeout { after: Duration },
+}
+
+impl VerifyKill {
+    pub fn is_stall(&self) -> bool {
+        matches!(self, Self::Stall { .. })
+    }
+}
 
 /// Outcome of running the configured verify commands.
 pub struct RunResult {
     pub passed: bool,
     pub failed_command: Option<String>,
     pub output: String,
+    /// Set when the harness killed the command (stall or optional timeout).
+    pub kill: Option<VerifyKill>,
 }
 
 /// Load a named command-array key (`verify`, `final_verify`) from
@@ -41,20 +61,11 @@ fn load_commands_key(repo: &Path, key: &str, required: bool) -> anyhow::Result<V
                 cfg.display()
             );
         }
-        // Placing `final_verify` at the BOTTOM of the file (a natural
+        // Placing a top-level key at the BOTTOM of the file (a natural
         // edit) scopes it under the last [section] — it would be silently
         // ignored. Detect that exact mistake and warn.
         if key == "final_verify" {
-            for section in ["commit", "model", "branch"] {
-                if t.get(section).is_some_and(|s| s.get(key).is_some()) {
-                    eprintln!(
-                        "  ⚠ `{key}` found inside [{section}] in {} — keys appended after a \
-                         [section] header belong to that section. Move it to the TOP of the \
-                         file (before any [section]) for it to take effect.",
-                        cfg.display()
-                    );
-                }
-            }
+            warn_if_key_nested_in_section(&t, key, &cfg);
         }
         return Ok(Vec::new());
     };
@@ -171,187 +182,92 @@ pub fn run(repo: &Path) -> anyhow::Result<RunResult> {
 
 /// Run the end-of-run FULL gate: `final_verify` from config when set
 /// (e.g. the slow e2e suite), otherwise the regular `verify` list.
+/// Command output is echoed live so a 40-minute suite is inspectable
+/// instead of a single FAIL line after the fact.
 pub fn run_final(repo: &Path) -> anyhow::Result<RunResult> {
-    run_commands(repo, &load_final_commands(repo)?)
+    run_commands_timed(
+        repo,
+        &load_final_commands(repo)?,
+        load_verify_timeout(repo),
+        load_verify_stall(repo),
+        true,
+    )
 }
 
-/// Run a scoped check when we can derive one from `paths` (Go packages).
-/// `Ok(None)` = no scoped command derivable — the CALLER decides to run
-/// the full suite. (The old internal fallback made every green cycle on a
-/// non-Go repo run the full suite twice: once here, once in the caller's
-/// follow-up `run`.)
-pub fn run_scoped(repo: &Path, paths: &[String]) -> anyhow::Result<Option<RunResult>> {
-    match scoped_commands(repo, paths) {
-        Some(cmds) => Ok(Some(run_commands(repo, &cmds)?)),
-        None => Ok(None),
-    }
-}
-
-/// `go test ./pkg...` for unique package dirs among `paths` (Go), or
-/// `cargo test -p crate…` for unique workspace crates among `paths`
-/// (Cargo workspace). None when no scoped command can be derived.
-pub fn scoped_commands(repo: &Path, paths: &[String]) -> Option<Vec<String>> {
-    if paths.is_empty() {
-        return None;
-    }
-    if repo.join("go.mod").exists() {
-        let pkgs = go_test_packages(repo, paths);
-        if pkgs.is_empty() {
-            return None;
-        }
-        // Shell-safe quoting: the command string goes through `sh -c` on
-        // Unix and `cmd /C` on Windows, so the quote character differs.
-        #[cfg(windows)]
-        let quote = |p: &str| format!("\"{p}\"");
-        #[cfg(not(windows))]
-        let quote = |p: &str| format!("'{p}'");
-        return Some(vec![format!(
-            "go test {}",
-            pkgs.iter().map(|p| quote(p)).collect::<Vec<_>>().join(" ")
-        )]);
-    }
-    if repo.join("Cargo.toml").exists() {
-        let crates = workspace_crates_touched(repo, paths);
-        if crates.is_empty() {
-            return None;
-        }
-        // Quoted `-p` flags: `cargo test -p 'crate' …` runs unit + bin +
-        // integration tests of exactly the touched crates — fast on big
-        // workspaces, and it catches fixer-added tests (redacter lesson).
-        #[cfg(windows)]
-        let quote = |p: &str| format!("\"{p}\"");
-        #[cfg(not(windows))]
-        let quote = |p: &str| format!("'{p}'");
-        return Some(vec![format!(
-            "cargo test {}",
-            crates
-                .iter()
-                .map(|c| format!("-p {}", quote(c)))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )]);
-    }
-    None
-}
-
-/// Map touched paths to unique workspace member crate names by reading
-/// each member's Cargo.toml `name` and matching paths under its directory.
-/// Returns empty when the repo is a single-crate project (no members) —
-/// the caller then falls back to the configured full suite.
-pub(crate) fn workspace_crates_touched(repo: &Path, paths: &[String]) -> Vec<String> {
-    // Parse the workspace members from the root Cargo.toml.
-    let Ok(text) = std::fs::read_to_string(repo.join("Cargo.toml")) else {
-        return Vec::new();
-    };
-    let Ok(t) = text.parse::<toml::Value>() else {
-        return Vec::new();
-    };
-    let Some(members) = t
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array())
-    else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = Vec::new();
-    for m in members.iter().filter_map(|v| v.as_str()) {
-        let member_dir = m.trim_end_matches('/').replace('\\', "/");
-        // `name` comes from the member manifest (fallback: dir basename).
-        let manifest = repo.join(format!("{member_dir}/Cargo.toml"));
-        let name = std::fs::read_to_string(&manifest)
-            .ok()
-            .and_then(|mt| mt.parse::<toml::Value>().ok())
-            .and_then(|mt| {
-                mt.get("package")
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| {
-                member_dir
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(member_dir.as_str())
-                    .to_string()
-            });
-        // Touched if any path lies under the member directory.
-        let prefix = format!("{member_dir}/");
-        if paths.iter().any(|p| {
-            let p = p.trim_start_matches("./").replace('\\', "/");
-            p == member_dir || p.starts_with(&prefix)
-        }) && !out.contains(&name)
-        {
-            out.push(name);
-        }
-    }
-    out
-}
-
-pub(crate) fn go_test_packages(repo: &Path, paths: &[String]) -> Vec<String> {
-    let mut pkgs = Vec::new();
-    for p in paths {
-        let rel = p.replace('\\', "/");
-        let rel = rel.trim_start_matches("./");
-        if rel.is_empty() || rel == "go.mod" || rel == "go.sum" {
-            continue;
-        }
-        // Only map REAL Go packages: `.go` files contribute their
-        // directory, and existing directories contribute themselves.
-        // Anything else (Makefile, LICENSE, Dockerfile, README…) is not a
-        // package — passing it to `go test` fails the whole command with
-        // 'matched no packages' and spuriously fails a good fix.
-        let dir = if rel.ends_with(".go") {
-            match rel.rsplit_once('/') {
-                Some((d, _)) => d.to_string(),
-                None => ".".to_string(), // .go file in repo root → root package
-            }
-        } else if repo.join(rel).is_dir() {
-            rel.trim_end_matches('/').to_string()
-        } else {
-            continue;
-        };
-        // Deleted/renamed source: a `.go` path whose parent dir no longer
-        // exists would yield a nonexistent package and fail `go test` with
-        // 'matched no packages', spuriously failing a good fix.
-        if !repo.join(&dir).is_dir() {
-            continue;
-        }
-        if dir.is_empty() {
-            continue;
-        }
-        let pkg = format!("./{dir}");
-        if !pkgs.contains(&pkg) {
-            pkgs.push(pkg);
-        }
-    }
-    pkgs
+/// Run an explicit command list (per-component `verify:` from the
+/// checklist). Same runner as the repo-wide `verify` list — no language
+/// knowledge here.
+pub fn run_list(repo: &Path, cmds: &[String]) -> anyhow::Result<RunResult> {
+    run_commands(repo, cmds)
 }
 
 fn run_commands(repo: &Path, cmds: &[String]) -> anyhow::Result<RunResult> {
+    run_commands_timed(
+        repo,
+        cmds,
+        load_verify_timeout(repo),
+        load_verify_stall(repo),
+        true,
+    )
+}
+
+fn run_commands_timed(
+    repo: &Path,
+    cmds: &[String],
+    timeout: Option<Duration>,
+    stall: Option<Duration>,
+    echo: bool,
+) -> anyhow::Result<RunResult> {
     let mut output = String::new();
     for cmd in cmds {
-        let result = run_shell(repo, cmd)
+        let mut result = run_shell(repo, cmd, timeout, stall, echo)
             .with_context(|| format!("failed to spawn verify command: {cmd}"))?;
         append_output(&mut output, &result.stdout, &result.stderr);
-        if result.timed_out {
-            // A timeout is a FAILED VERIFY, not a harness abort: the loop's
-            // fix-cycle logic (and the verify classifier recipe) handles a
-            // red result — an Err here would kill the whole run instead.
-            output.push_str(&format!(
-                "[gaggle] verify command timed out after {}s and was killed\n",
-                verify_timeout().as_secs()
-            ));
-            return Ok(RunResult {
-                passed: false,
-                failed_command: Some(cmd.clone()),
-                output,
-            });
+        if let Some(kill) = result.kill.clone() {
+            let last = last_nonempty_line(&output).map(str::to_string);
+            note_kill(&mut output, cmd, &kill, last.as_deref());
+            // Early stall (hung almost immediately) is often a lock or a
+            // spawn glitch — retry once. A stall after real work must not
+            // restart a multi-hour compile. Wall-clock timeout is a CI
+            // budget: no retry.
+            // Use time-to-kill, not time-to-return: after SIGTERM the
+            // pipe-drain join can sit up to 5s, which would otherwise
+            // push a 1s hang past the 2×window "early" bound.
+            let early_stall = match (&kill, stall) {
+                (VerifyKill::Stall { .. }, Some(window)) => result.ran_for <= window * 2,
+                _ => false,
+            };
+            if early_stall {
+                eprintln!("  ⚠ verify stalled early — retrying once: {cmd}");
+                output.push_str("[gaggle] verify stalled early — retrying once\n");
+                result = run_shell(repo, cmd, timeout, stall, echo)
+                    .with_context(|| format!("failed to spawn verify command: {cmd}"))?;
+                append_output(&mut output, &result.stdout, &result.stderr);
+                if let Some(kill) = result.kill.clone() {
+                    let last = last_nonempty_line(&output).map(str::to_string);
+                    note_kill(&mut output, cmd, &kill, last.as_deref());
+                    return Ok(RunResult {
+                        passed: false,
+                        failed_command: Some(cmd.clone()),
+                        output,
+                        kill: Some(kill),
+                    });
+                }
+            } else {
+                return Ok(RunResult {
+                    passed: false,
+                    failed_command: Some(cmd.clone()),
+                    output,
+                    kill: Some(kill),
+                });
+            }
         }
         if !result.success {
             return Ok(RunResult {
                 passed: false,
                 failed_command: Some(cmd.clone()),
                 output,
+                kill: None,
             });
         }
     }
@@ -359,48 +275,218 @@ fn run_commands(repo: &Path, cmds: &[String]) -> anyhow::Result<RunResult> {
         passed: true,
         failed_command: None,
         output,
+        kill: None,
     })
 }
 
-/// Wall-clock ceiling for ONE verify command. A hung command (waiting on
-/// a network resource, a stuck prompt) must not block the loop forever.
-/// Override with `GAGGLE_VERIFY_TIMEOUT_SECS`.
-const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+fn note_kill(output: &mut String, cmd: &str, kill: &VerifyKill, last_line: Option<&str>) {
+    let last = last_line
+        .map(|l| format!("; last output: {l}"))
+        .unwrap_or_default();
+    let msg = match kill {
+        VerifyKill::Stall { idle } => format!(
+            "[gaggle] verify stalled after {}s with no output and no CPU (killed){last}: {cmd}\n",
+            idle.as_secs()
+        ),
+        VerifyKill::Timeout { after } => {
+            format!(
+                "[gaggle] verify command timed out after {}s and was killed{last}: {cmd}\n",
+                after.as_secs()
+            )
+        }
+    };
+    match kill {
+        VerifyKill::Stall { idle } => eprintln!(
+            "  ⚠ verify stalled after {}s with no output and no CPU{last}: {cmd}",
+            idle.as_secs()
+        ),
+        VerifyKill::Timeout { after } => eprintln!(
+            "  ⚠ verify command timed out after {}s (killed){last}: {cmd}",
+            after.as_secs()
+        ),
+    }
+    output.push_str(&msg);
+}
+
+fn last_nonempty_line(s: &str) -> Option<&str> {
+    s.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("[gaggle]"))
+}
 
 /// Cap per-stream bytes we keep in memory from a verify command; a
 /// runaway command writing forever would otherwise grow the buffer
 /// without bound. (Diagnostics only ever surface the tail.)
 const VERIFY_OUTPUT_CAP: usize = 10 * 1024 * 1024;
 
-fn verify_timeout() -> std::time::Duration {
-    match std::env::var("GAGGLE_VERIFY_TIMEOUT_SECS") {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(secs) => std::time::Duration::from_secs(secs.max(1)),
-            // A user-specified override that fails to parse must not be
-            // silently ignored — warn (but keep the run going on default).
-            Err(_) => {
-                eprintln!(
-                    "  ⚠ GAGGLE_VERIFY_TIMEOUT_SECS={raw:?} is not a number of seconds — using default {}s",
-                    VERIFY_TIMEOUT.as_secs()
-                );
-                VERIFY_TIMEOUT
-            }
-        },
-        Err(_) => VERIFY_TIMEOUT,
+/// Tables a top-level key can accidentally land in when appended after a
+/// `[section]` header. Keep in sync with the documented config sections.
+const CONFIG_SECTIONS: [&str; 3] = ["commit", "model", "branch"];
+
+fn warn_if_key_nested_in_section(t: &toml::Value, key: &str, cfg: &Path) {
+    for section in CONFIG_SECTIONS {
+        if t.get(section).is_some_and(|s| s.get(key).is_some()) {
+            eprintln!(
+                "  ⚠ `{key}` found inside [{section}] in {} — keys appended after a \
+                 [section] header belong to that section. Move it to the TOP of the \
+                 file (before any [section]) for it to take effect.",
+                cfg.display()
+            );
+        }
     }
 }
 
-/// Outcome of one shell command: exit status + drained output, or a
-/// timeout marker (the run continues as a FAILED verify, not an abort,
-/// so the verify recipe can classify/retry it).
-struct ShellOutcome {
-    success: bool,
-    timed_out: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+/// Optional `verify_timeout_secs` from `.review/config.toml`. `None` when
+/// unset, unreadable, or invalid — and `None` means *no timeout*, not a
+/// default. Warns rather than failing the run: a bad timeout must not
+/// skip the gate.
+fn load_timeout_from_config(repo: &Path) -> Option<u64> {
+    let cfg = repo.join(".review/config.toml");
+    let text = std::fs::read_to_string(&cfg).ok()?;
+    let t: toml::Value = text.parse().ok()?;
+    match t.get("verify_timeout_secs") {
+        None => {
+            warn_if_key_nested_in_section(&t, "verify_timeout_secs", &cfg);
+            None
+        }
+        Some(v) => match v.as_integer() {
+            Some(n) if n >= 1 => Some(n as u64),
+            Some(_) => {
+                eprintln!(
+                    "  ⚠ `verify_timeout_secs` must be a positive integer in {} — leaving timeout unset",
+                    cfg.display()
+                );
+                None
+            }
+            None => {
+                eprintln!(
+                    "  ⚠ `verify_timeout_secs` must be a number of seconds in {} (found `{}`) — leaving timeout unset",
+                    cfg.display(),
+                    v.type_str()
+                );
+                None
+            }
+        },
+    }
 }
 
-fn run_shell(repo: &Path, cmd: &str) -> anyhow::Result<ShellOutcome> {
+/// Env `GAGGLE_VERIFY_TIMEOUT_SECS` (if set and valid) wins over config.
+/// Unset env and unset config means no timeout: the command runs until
+/// it exits. An invalid env value is warned about and ignored so a typo
+/// does not skip a repo-level setting.
+fn resolve_verify_timeout(
+    env_raw: Option<&str>,
+    config_secs: Option<u64>,
+) -> Option<std::time::Duration> {
+    if let Some(raw) = env_raw {
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if secs >= 1 => return Some(std::time::Duration::from_secs(secs)),
+            Ok(_) => {
+                // `0` is an explicit "no timeout"; env still wins over config.
+                return None;
+            }
+            Err(_) => {
+                eprintln!(
+                    "  ⚠ GAGGLE_VERIFY_TIMEOUT_SECS={raw:?} is not a number of seconds — ignoring"
+                );
+            }
+        }
+    }
+    config_secs.map(|secs| std::time::Duration::from_secs(secs.max(1)))
+}
+
+fn load_verify_timeout(repo: &Path) -> Option<Duration> {
+    resolve_verify_timeout(
+        std::env::var("GAGGLE_VERIFY_TIMEOUT_SECS").ok().as_deref(),
+        load_timeout_from_config(repo),
+    )
+}
+
+/// Default idle window before a silent, idle process tree is considered hung.
+const DEFAULT_STALL: Duration = Duration::from_secs(15 * 60);
+
+/// Optional `verify_stall_secs`. `Some(0)` means explicitly off; `None` means
+/// the key is absent/invalid (caller then applies the default).
+fn load_stall_from_config(repo: &Path) -> Option<u64> {
+    let cfg = repo.join(".review/config.toml");
+    let text = std::fs::read_to_string(&cfg).ok()?;
+    let t: toml::Value = text.parse().ok()?;
+    match t.get("verify_stall_secs") {
+        None => {
+            warn_if_key_nested_in_section(&t, "verify_stall_secs", &cfg);
+            None
+        }
+        Some(v) => match v.as_integer() {
+            Some(n) if n >= 0 => Some(n as u64),
+            Some(_) => {
+                eprintln!(
+                    "  ⚠ `verify_stall_secs` must be ≥ 0 in {} — using default {}s",
+                    cfg.display(),
+                    DEFAULT_STALL.as_secs()
+                );
+                None
+            }
+            None => {
+                eprintln!(
+                    "  ⚠ `verify_stall_secs` must be a number of seconds in {} (found `{}`) — using default {}s",
+                    cfg.display(),
+                    v.type_str(),
+                    DEFAULT_STALL.as_secs()
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Env `GAGGLE_VERIFY_STALL_SECS` wins. `0` disables stall detection.
+/// Unset env + unset config → 15 minutes of no I/O and no CPU.
+fn resolve_verify_stall(env_raw: Option<&str>, config_secs: Option<u64>) -> Option<Duration> {
+    if let Some(raw) = env_raw {
+        match raw.trim().parse::<u64>() {
+            Ok(0) => return None,
+            Ok(secs) => return Some(Duration::from_secs(secs)),
+            Err(_) => {
+                eprintln!(
+                    "  ⚠ GAGGLE_VERIFY_STALL_SECS={raw:?} is not a number of seconds — ignoring"
+                );
+            }
+        }
+    }
+    match config_secs {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(DEFAULT_STALL),
+    }
+}
+
+fn load_verify_stall(repo: &Path) -> Option<Duration> {
+    resolve_verify_stall(
+        std::env::var("GAGGLE_VERIFY_STALL_SECS").ok().as_deref(),
+        load_stall_from_config(repo),
+    )
+}
+
+/// Outcome of one shell command: exit status + drained output, or a
+/// kill marker (the run continues as a FAILED verify, not an abort).
+struct ShellOutcome {
+    success: bool,
+    kill: Option<VerifyKill>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// Elapsed from spawn until the command exited or we decided to kill
+    /// it. Does not include the post-kill pipe-drain wait.
+    ran_for: Duration,
+}
+
+fn run_shell(
+    repo: &Path,
+    cmd: &str,
+    timeout: Option<Duration>,
+    stall: Option<Duration>,
+    echo: bool,
+) -> anyhow::Result<ShellOutcome> {
     #[cfg(windows)]
     let mut child = {
         let mut c = Command::new("cmd");
@@ -433,7 +519,23 @@ fn run_shell(repo: &Path, cmd: &str) -> anyhow::Result<ShellOutcome> {
     // we KEEP READING AND DISCARDING to EOF — dropping the read end here
     // would SIGPIPE the child on its next write, turning a green command
     // into a spurious failed verify.
-    fn drain(mut r: std::process::ChildStdout) -> Vec<u8> {
+    fn echo_write(to_stderr: bool, bytes: &[u8]) {
+        use std::io::Write;
+        if to_stderr {
+            let _ = std::io::stderr().write_all(bytes);
+            let _ = std::io::stderr().flush();
+        } else {
+            let _ = std::io::stdout().write_all(bytes);
+            let _ = std::io::stdout().flush();
+        }
+    }
+    let io_progress = Arc::new(AtomicU64::new(0));
+    fn bump_io(io: &AtomicU64, n: usize) {
+        if n > 0 {
+            io.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+    fn drain(mut r: std::process::ChildStdout, echo: bool, io: Arc<AtomicU64>) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         use std::io::Read;
@@ -444,7 +546,13 @@ fn run_shell(repo: &Path, cmd: &str) -> anyhow::Result<ShellOutcome> {
                     Ok(0) => break,
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
-                    Ok(_) => continue,
+                    Ok(n) => {
+                        bump_io(&io, n);
+                        if echo {
+                            echo_write(false, &chunk[..n]);
+                        }
+                        continue;
+                    }
                 }
             }
             match r.read(&mut chunk) {
@@ -453,13 +561,19 @@ fn run_shell(repo: &Path, cmd: &str) -> anyhow::Result<ShellOutcome> {
                 // truncate diagnostics (possibly the failing error text).
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    bump_io(&io, n);
+                    if echo {
+                        echo_write(false, &chunk[..n]);
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
             }
         }
         buf
     }
     // ChildStderr is a distinct type; duplicate the body.
-    fn drain_err(mut r: std::process::ChildStderr) -> Vec<u8> {
+    fn drain_err(mut r: std::process::ChildStderr, echo: bool, io: Arc<AtomicU64>) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         use std::io::Read;
@@ -469,46 +583,97 @@ fn run_shell(repo: &Path, cmd: &str) -> anyhow::Result<ShellOutcome> {
                     Ok(0) => break,
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
-                    Ok(_) => continue,
+                    Ok(n) => {
+                        bump_io(&io, n);
+                        if echo {
+                            echo_write(true, &chunk[..n]);
+                        }
+                        continue;
+                    }
                 }
             }
             match r.read(&mut chunk) {
                 Ok(0) => break,
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    bump_io(&io, n);
+                    if echo {
+                        echo_write(true, &chunk[..n]);
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
             }
         }
         buf
     }
+    let io_out = Arc::clone(&io_progress);
+    let io_err = Arc::clone(&io_progress);
     let out_handle = child
         .stdout
         .take()
-        .map(|r| std::thread::spawn(move || drain(r)));
+        .map(|r| std::thread::spawn(move || drain(r, echo, io_out)));
     let err_handle = child
         .stderr
         .take()
-        .map(|r| std::thread::spawn(move || drain_err(r)));
+        .map(|r| std::thread::spawn(move || drain_err(r, echo, io_err)));
 
-    let timeout = verify_timeout();
-    let deadline = std::time::Instant::now() + timeout;
-    let mut timed_out = false;
+    let spawned = Instant::now();
+    let deadline = timeout.map(|t| spawned + t);
+    let pgid = child.id();
+    let mut last_progress = spawned;
+    let mut last_io = 0u64;
+    let mut last_cpu: Option<u64> = None;
+    let mut last_cpu_sample = spawned;
+    let mut kill = None;
+    let ran_for;
     let status_success;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                ran_for = spawned.elapsed();
                 status_success = status.success();
                 break;
             }
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    timed_out = true;
+                let now = Instant::now();
+                if deadline.is_some_and(|d| now >= d) {
+                    ran_for = spawned.elapsed();
+                    kill = Some(VerifyKill::Timeout {
+                        after: timeout.unwrap_or_default(),
+                    });
                     kill_tree(&mut child);
                     let _ = child.wait(); // reap so OUR pipes close
                     status_success = false;
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let io = io_progress.load(Ordering::Relaxed);
+                if io > last_io {
+                    last_progress = now;
+                    last_io = io;
+                }
+                if last_cpu.is_none()
+                    || now.duration_since(last_cpu_sample) >= Duration::from_millis(250)
+                {
+                    if let Some(cpu) = process_group_cpu_ms(pgid) {
+                        if last_cpu.is_some_and(|prev| cpu > prev) {
+                            last_progress = now;
+                        }
+                        last_cpu = Some(cpu);
+                    }
+                    last_cpu_sample = now;
+                }
+                if stall.is_some_and(|s| now.duration_since(last_progress) >= s) {
+                    ran_for = spawned.elapsed();
+                    kill = Some(VerifyKill::Stall {
+                        idle: stall.unwrap_or_default(),
+                    });
+                    kill_tree(&mut child);
+                    let _ = child.wait();
+                    status_success = false;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
                 kill_tree(&mut child);
@@ -537,17 +702,12 @@ fn run_shell(repo: &Path, cmd: &str) -> anyhow::Result<ShellOutcome> {
     let stdout = join_bounded(out_handle);
     let stderr = join_bounded(err_handle);
 
-    if timed_out {
-        eprintln!(
-            "  ⚠ verify command timed out after {}s (killed): {cmd}",
-            timeout.as_secs()
-        );
-    }
     Ok(ShellOutcome {
         success: status_success,
-        timed_out,
+        kill,
         stdout,
         stderr,
+        ran_for,
     })
 }
 
@@ -570,6 +730,86 @@ fn kill_tree(child: &mut std::process::Child) {
         }
     }
     let _ = child.kill();
+}
+
+/// Sum CPU time of processes in `pgid`, in milliseconds. `None` when we
+/// cannot sample (Windows, `ps` missing, parse failure) — stall then
+/// rests on I/O alone.
+fn process_group_cpu_ms(pgid: u32) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let _ = pgid;
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("ps")
+            .args(["-ax", "-o", "pgid=,time="])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut total = 0u64;
+        let mut any = false;
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(g) = parts.next() else { continue };
+            let Ok(g) = g.parse::<u32>() else { continue };
+            if g != pgid {
+                continue;
+            }
+            let Some(t) = parts.next() else { continue };
+            let Some(ms) = parse_ps_time(t) else { continue };
+            total = total.saturating_add(ms);
+            any = true;
+        }
+        any.then_some(total)
+    }
+}
+
+/// Parse `ps` TIME (`ss`, `mm:ss`, `mm:ss.ss`, `hh:mm:ss`) to milliseconds.
+/// Compiled on Unix (stall CPU sampling) and in tests (the parser is
+/// exercised on every OS so a Windows CI run still covers the formats).
+#[cfg(any(test, not(windows)))]
+fn parse_ps_time(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let parts: Vec<&str> = s.split(':').collect();
+    let to_ms = |raw: &str| -> Option<u64> {
+        if let Some((whole, frac)) = raw.split_once('.') {
+            let secs: u64 = whole.parse().ok()?;
+            let frac = frac.trim_end_matches(|c: char| !c.is_ascii_digit());
+            let millis = match frac.len() {
+                0 => 0,
+                1 => frac.parse::<u64>().ok()? * 100,
+                2 => frac.parse::<u64>().ok()? * 10,
+                _ => frac[..3].parse::<u64>().ok()?,
+            };
+            Some(secs.saturating_mul(1000).saturating_add(millis))
+        } else {
+            let secs: u64 = raw.parse().ok()?;
+            Some(secs.saturating_mul(1000))
+        }
+    };
+    match parts.as_slice() {
+        [sec] => to_ms(sec),
+        [min, sec] => {
+            let min: u64 = min.parse().ok()?;
+            Some(min.saturating_mul(60_000).saturating_add(to_ms(sec)?))
+        }
+        [hour, min, sec] => {
+            let hour: u64 = hour.parse().ok()?;
+            let min: u64 = min.parse().ok()?;
+            Some(
+                hour.saturating_mul(3_600_000)
+                    .saturating_add(min.saturating_mul(60_000))
+                    .saturating_add(to_ms(sec)?),
+            )
+        }
+        _ => None,
+    }
 }
 
 fn append_output(buf: &mut String, stdout: &[u8], stderr: &[u8]) {
@@ -659,57 +899,6 @@ mod tests {
         assert!(t.is_char_boundary(0));
         assert!(s.ends_with(t));
     }
-
-    #[test]
-    fn go_packages_from_paths() {
-        let dir = temp_repo();
-        std::fs::create_dir_all(dir.join("internal/game")).unwrap();
-        std::fs::create_dir_all(dir.join("internal/p2p")).unwrap();
-        std::fs::write(dir.join("internal/game/game.go"), "package game\n").unwrap();
-        std::fs::write(dir.join("Makefile"), "all:\n").unwrap();
-        std::fs::write(dir.join("LICENSE"), "MIT\n").unwrap();
-        let pkgs = go_test_packages(
-            &dir,
-            &[
-                "internal/game/game.go".into(),
-                "internal/game/game_test.go".into(),
-                "internal/p2p".into(),
-                "go.mod".into(),
-                "mise.toml".into(),
-                // Extension-less NON-directory files must NOT become
-                // packages ('go test ./Makefile' fails with 'matched no
-                // packages').
-                "Makefile".into(),
-                "LICENSE".into(),
-                "Dockerfile".into(),
-                ".gitignore".into(),
-            ],
-        );
-        assert_eq!(pkgs, vec!["./internal/game", "./internal/p2p"]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn scoped_commands_quote_packages() {
-        let dir = temp_repo();
-        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
-        std::fs::create_dir_all(dir.join("my pkg")).unwrap();
-        let cmds =
-            scoped_commands(&dir, &["my pkg".into()]).expect("package dir maps to a command");
-        assert_eq!(cmds.len(), 1);
-        #[cfg(windows)]
-        assert_eq!(cmds[0], r#"go test "./my pkg""#);
-        #[cfg(not(windows))]
-        assert_eq!(cmds[0], r"go test './my pkg'");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn scoped_commands_none_without_gomod() {
-        let dir = temp_repo();
-        assert!(scoped_commands(&dir, &["internal/game/game.go".into()]).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 #[cfg(test)]
@@ -749,49 +938,6 @@ mod final_and_scoped_tests {
             load_final_commands(&dir).unwrap(),
             vec!["cargo test --workspace"]
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rust_workspace_scopes_to_touched_crates() {
-        let dir = temp_repo();
-        std::fs::write(
-            dir.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/core\", \"crates/cli\"]\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.join("crates/core/src")).unwrap();
-        std::fs::create_dir_all(dir.join("crates/cli/src")).unwrap();
-        std::fs::write(
-            dir.join("crates/core/Cargo.toml"),
-            "[package]\nname = \"redact-core\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("crates/cli/Cargo.toml"),
-            "[package]\nname = \"redact-cli\"\n",
-        )
-        .unwrap();
-        // Touched core only → scoped command tests core only.
-        let touched = vec!["crates/core/src/engine.rs".to_string()];
-        let cmds = scoped_commands(&dir, &touched).expect("workspace derives scoped cmds");
-        assert_eq!(cmds.len(), 1);
-        #[cfg(not(windows))]
-        assert_eq!(cmds[0], "cargo test -p 'redact-core'");
-        #[cfg(windows)]
-        assert_eq!(cmds[0], "cargo test -p \"redact-core\"");
-        // Touched both → both crates, deterministic order (member order).
-        let touched = vec![
-            "crates/cli/src/main.rs".to_string(),
-            "crates/core/src/lib.rs".to_string(),
-        ];
-        let cmds = scoped_commands(&dir, &touched).expect("scoped");
-        #[cfg(not(windows))]
-        assert_eq!(cmds[0], "cargo test -p 'redact-core' -p 'redact-cli'");
-        #[cfg(windows)]
-        assert_eq!(cmds[0], "cargo test -p \"redact-core\" -p \"redact-cli\"");
-        // No touched paths under members → None (caller falls back).
-        assert!(scoped_commands(&dir, &["docs/README.md".to_string()]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -839,6 +985,289 @@ mod gate_file_tests {
         // `./...` is Go's recursive package wildcard, not a repo file
         // (and on Windows `join("...")` would otherwise be the repo root).
         assert!(gate_files(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_repo() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gaggle-timeout-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join(".review")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_unset_means_no_timeout() {
+        assert_eq!(resolve_verify_timeout(None, None), None);
+        assert_eq!(
+            resolve_verify_timeout(None, Some(120)),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            resolve_verify_timeout(Some("30"), Some(120)),
+            Some(Duration::from_secs(30))
+        );
+        // Invalid env is ignored so a typo does not skip the config value.
+        assert_eq!(
+            resolve_verify_timeout(Some("nope"), Some(120)),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(resolve_verify_timeout(Some("nope"), None), None);
+        // Zero env is an explicit "no timeout" and wins over config.
+        assert_eq!(resolve_verify_timeout(Some("0"), Some(120)), None);
+        assert_eq!(resolve_verify_timeout(Some("0"), None), None);
+    }
+
+    #[test]
+    fn load_timeout_from_config_reads_positive_integer() {
+        let dir = temp_repo();
+        std::fs::write(
+            dir.join(".review/config.toml"),
+            "verify = [\"true\"]\nverify_timeout_secs = 42\n",
+        )
+        .unwrap();
+        assert_eq!(load_timeout_from_config(&dir), Some(42));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_timeout_from_config_ignores_nested_and_invalid() {
+        let dir = temp_repo();
+        std::fs::write(
+            dir.join(".review/config.toml"),
+            "verify = [\"true\"]\n[commit]\nsign = false\nverify_timeout_secs = 12\n",
+        )
+        .unwrap();
+        assert_eq!(load_timeout_from_config(&dir), None);
+
+        std::fs::write(
+            dir.join(".review/config.toml"),
+            "verify = [\"true\"]\nverify_timeout_secs = 0\n",
+        )
+        .unwrap();
+        assert_eq!(load_timeout_from_config(&dir), None);
+
+        std::fs::write(
+            dir.join(".review/config.toml"),
+            "verify = [\"true\"]\nverify_timeout_secs = \"900\"\n",
+        )
+        .unwrap();
+        assert_eq!(load_timeout_from_config(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unset_timeout_waits_for_a_slow_command() {
+        let dir = temp_repo();
+        #[cfg(windows)]
+        let cfg = "verify = [\"ping -n 3 127.0.0.1 >nul\"]\n";
+        #[cfg(not(windows))]
+        let cfg = "verify = [\"sleep 1\"]\n";
+        std::fs::write(dir.join(".review/config.toml"), cfg).unwrap();
+        let cmds = load_commands(&dir).unwrap();
+        let result = run_commands_timed(&dir, &cmds, None, None, false).unwrap();
+        assert!(
+            result.passed,
+            "unset timeout must wait, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("timed out"),
+            "must not kill when timeout is unset: {}",
+            result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wall_clock_timeout_fails_without_retry() {
+        let dir = temp_repo();
+        #[cfg(windows)]
+        let cfg = "verify = [\"ping -n 31 127.0.0.1 >nul\"]\n";
+        #[cfg(not(windows))]
+        let cfg = "verify = [\"sleep 30\"]\n";
+        std::fs::write(dir.join(".review/config.toml"), cfg).unwrap();
+        let cmds = load_commands(&dir).unwrap();
+        let result =
+            run_commands_timed(&dir, &cmds, Some(Duration::from_secs(1)), None, false).unwrap();
+        assert!(!result.passed);
+        assert!(result.kill.is_some());
+        assert!(
+            result.output.contains("timed out"),
+            "missing timeout note: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("retrying once"),
+            "wall-clock timeout must not retry: {}",
+            result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_stall_defaults_to_15m_zero_disables() {
+        assert_eq!(
+            resolve_verify_stall(None, None),
+            Some(Duration::from_secs(15 * 60))
+        );
+        assert_eq!(resolve_verify_stall(Some("0"), Some(120)), None);
+        assert_eq!(resolve_verify_stall(None, Some(0)), None);
+        assert_eq!(
+            resolve_verify_stall(None, Some(30)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            resolve_verify_stall(Some("12"), Some(30)),
+            Some(Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn parse_ps_time_formats() {
+        assert_eq!(parse_ps_time("0:00.12"), Some(120));
+        assert_eq!(parse_ps_time("1:02.03"), Some(62_030));
+        assert_eq!(parse_ps_time("1:02:03"), Some(3_723_000));
+        assert_eq!(parse_ps_time("5"), Some(5_000));
+    }
+
+    #[test]
+    fn silent_command_is_killed_as_stall() {
+        let dir = temp_repo();
+        #[cfg(windows)]
+        let cfg = "verify = [\"ping -n 31 127.0.0.1 >nul\"]\n";
+        #[cfg(not(windows))]
+        let cfg = "verify = [\"sleep 30\"]\n";
+        std::fs::write(dir.join(".review/config.toml"), cfg).unwrap();
+        let cmds = load_commands(&dir).unwrap();
+        let result =
+            run_commands_timed(&dir, &cmds, None, Some(Duration::from_secs(1)), false).unwrap();
+        assert!(
+            !result.passed,
+            "silent sleep must stall, got: {}",
+            result.output
+        );
+        assert!(
+            result.kill.as_ref().is_some_and(|k| k.is_stall()),
+            "expected stall, got {:?}",
+            result.kill
+        );
+        assert!(
+            result.output.contains("stalled"),
+            "missing stall note: {}",
+            result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn io_progress_prevents_stall() {
+        let dir = temp_repo();
+        #[cfg(windows)]
+        let cfg = "verify = [\"echo tick & ping -n 2 127.0.0.1 >nul & echo tick & ping -n 2 127.0.0.1 >nul & echo tick\"]\n";
+        #[cfg(not(windows))]
+        let cfg = "verify = [\"sh -c 'for i in 1 2 3 4 5; do echo tick; sleep 1; done'\"]\n";
+        std::fs::write(dir.join(".review/config.toml"), cfg).unwrap();
+        let cmds = load_commands(&dir).unwrap();
+        let result =
+            run_commands_timed(&dir, &cmds, None, Some(Duration::from_secs(2)), false).unwrap();
+        assert!(
+            result.passed,
+            "periodic output must count as progress, got: {}",
+            result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn early_stall_retries_once() {
+        let dir = temp_repo();
+        #[cfg(windows)]
+        {
+            std::fs::write(
+                dir.join("hang.cmd"),
+                "@echo off\r\nif exist ran exit /b 0\r\necho. > ran\r\nping -n 31 127.0.0.1 >nul\r\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join(".review/config.toml"), "verify = [\"hang.cmd\"]\n").unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::write(
+                dir.join("hang.sh"),
+                "#!/bin/sh\nif [ -f ran ]; then exit 0; fi\ntouch ran\nsleep 30\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join(".review/config.toml"),
+                "verify = [\"sh hang.sh\"]\n",
+            )
+            .unwrap();
+        }
+        let cmds = load_commands(&dir).unwrap();
+        let result =
+            run_commands_timed(&dir, &cmds, None, Some(Duration::from_secs(1)), false).unwrap();
+        assert!(
+            result.passed,
+            "early stall must retry, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("retrying once"),
+            "missing retry note: {}",
+            result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn late_stall_does_not_retry() {
+        let dir = temp_repo();
+        // Busy (CPU) past 2×stall, then go idle — must fail without retry.
+        let cfg = "verify = [\"sh -c 'yes >/dev/null & y=$!; sleep 5; kill $y; sleep 30'\"]\n";
+        std::fs::write(dir.join(".review/config.toml"), cfg).unwrap();
+        let cmds = load_commands(&dir).unwrap();
+        let result =
+            run_commands_timed(&dir, &cmds, None, Some(Duration::from_secs(2)), false).unwrap();
+        assert!(!result.passed);
+        assert!(result.kill.as_ref().is_some_and(|k| k.is_stall()));
+        assert!(
+            !result.output.contains("retrying once"),
+            "late stall must not retry: {}",
+            result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn cpu_progress_prevents_stall() {
+        let dir = temp_repo();
+        std::fs::write(
+            dir.join(".review/config.toml"),
+            "verify = [\"sh -c 'yes >/dev/null & y=$!; sleep 4; kill $y'\"]\n",
+        )
+        .unwrap();
+        let cmds = load_commands(&dir).unwrap();
+        let result =
+            run_commands_timed(&dir, &cmds, None, Some(Duration::from_secs(2)), false).unwrap();
+        assert!(
+            result.passed,
+            "CPU-only work must count as progress, got: {}",
+            result.output
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

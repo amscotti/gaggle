@@ -6,6 +6,7 @@
 use crate::goose;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
 
 /// Hard caps for AI-proposed components (guards runaway splits).
@@ -20,17 +21,25 @@ pub struct DiscoveredComponent {
     pub paths: Vec<String>,
     pub tier: String,
     pub priority: u32,
+    /// Shell commands that check this slice. Empty = repo-wide `verify`.
+    pub verify: Vec<String>,
 }
 
-/// Run the discovery recipe and return validated, normalized components.
+/// Full discovery result: project-wide gates plus components.
+#[derive(Debug, Clone)]
+pub struct Discovery {
+    pub verify: Vec<String>,
+    pub final_verify: Vec<String>,
+    pub components: Vec<DiscoveredComponent>,
+}
+
+/// Run the discovery recipe and return validated components plus the
+/// project-wide verify commands the agent copied from this repo's own
+/// test/CI docs. The harness does not invent those commands.
 ///
 /// `existing_file` is a path the recipe should open — never inline
 /// checklist text (newlines/`=` are rejected by `--params`).
-pub fn discover(
-    repo: &Path,
-    project_name: &str,
-    existing_file: &Path,
-) -> Result<Vec<DiscoveredComponent>> {
+pub fn discover(repo: &Path, project_name: &str, existing_file: &Path) -> Result<Discovery> {
     let recipe = crate::recipes::path(repo, "discover.yaml")?;
     let existing = existing_file.to_string_lossy();
     let params = [
@@ -38,26 +47,153 @@ pub fn discover(
         ("existing", existing.as_ref()),
     ];
     let outcome = goose::run_recipe(repo, &recipe, &params, Some(80))?;
-    let result = outcome.result;
-    // Contract: {"components": [...]}. Lenient fallbacks ("agent invents,
-    // harness decides"): a bare ARRAY of components, or a single bare
-    // component OBJECT (both observed from otherwise-successful runs).
-    let raw = if result.get("components").is_some() {
-        result.get("components").cloned().unwrap()
+    let payload = parse_discovery_payload(&outcome.result)?;
+    Ok(Discovery {
+        verify: payload.verify,
+        final_verify: payload.final_verify,
+        components: normalize(payload.components)?,
+    })
+}
+
+/// Write the first-pass proposal so the validate recipe can open it.
+pub fn write_proposal(path: &Path, d: &Discovery) -> Result<()> {
+    let body = serde_json::json!({
+        "verify": d.verify,
+        "final_verify": d.final_verify,
+        "components": d.components,
+    });
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(&body)? + "\n")?;
+    Ok(())
+}
+
+/// Second agent pass: check the proposal against the tree and return a
+/// corrected payload. If the validator flakes or returns no components,
+/// the original proposal is kept.
+pub fn validate(
+    repo: &Path,
+    project_name: &str,
+    proposal: &Path,
+    original: Discovery,
+) -> Result<Discovery> {
+    let recipe = crate::recipes::path(repo, "discover-validate.yaml")?;
+    let proposal_s = proposal.to_string_lossy().to_string();
+    let params = [
+        ("project_name", project_name),
+        ("proposal", proposal_s.as_str()),
+    ];
+    let outcome = match goose::run_recipe(repo, &recipe, &params, Some(80)) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("  warning: discovery validate failed ({e:#}) — keeping first-pass proposal");
+            return Ok(original);
+        }
+    };
+    let payload = match parse_discovery_payload(&outcome.result) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "  warning: discovery validate returned unusable JSON ({e:#}) — keeping first-pass proposal"
+            );
+            return Ok(original);
+        }
+    };
+    if payload.components.is_empty() {
+        eprintln!(
+            "  warning: discovery validate returned no components — keeping first-pass proposal"
+        );
+        return Ok(original);
+    }
+    let ok = outcome
+        .result
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let components = normalize(payload.components)?;
+    if ok {
+        println!(
+            "  discovery validate: ok ({} component(s))",
+            components.len()
+        );
+    } else {
+        println!(
+            "  discovery validate: corrected to {} component(s)",
+            components.len()
+        );
+    }
+    Ok(Discovery {
+        verify: if payload.verify.is_empty() {
+            original.verify
+        } else {
+            payload.verify
+        },
+        final_verify: if payload.final_verify.is_empty() {
+            original.final_verify
+        } else {
+            payload.final_verify
+        },
+        components,
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscoveryPayload {
+    pub verify: Vec<String>,
+    pub final_verify: Vec<String>,
+    pub components: Vec<RawItem>,
+}
+
+fn string_cmds(v: Option<&serde_json::Value>) -> Vec<String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(other) => {
+            eprintln!("  discover: ignoring non-array `{other}` for a command list");
+            Vec::new()
+        }
+    }
+}
+
+/// Contract: `{"verify": [...], "final_verify": [...], "components": [ ... ]}`.
+/// A bare ARRAY of components is accepted (gates then empty). A single
+/// component OBJECT is a truncated answer — not a list.
+pub(crate) fn parse_discovery_payload(result: &serde_json::Value) -> Result<DiscoveryPayload> {
+    let verify = string_cmds(result.get("verify"));
+    let final_verify = string_cmds(result.get("final_verify"));
+    let raw = if let Some(c) = result.get("components") {
+        if !c.is_array() {
+            bail!("discovery \"components\" must be an array, got {c}");
+        }
+        c.clone()
     } else if result.is_array() {
         eprintln!(
             "  discover: agent returned a bare array (not wrapped in {{\"components\": …}}) — accepting"
         );
         result.clone()
     } else if result.get("slug").is_some() && result.get("paths").is_some() {
-        eprintln!("  discover: agent returned a single bare component object — wrapping");
-        serde_json::json!([result])
+        bail!(
+            "discovery returned a single component object instead of {{\"components\": [...]}} \
+             (truncated answer)"
+        );
     } else {
-        anyhow::bail!("discovery result missing \"components\" key: {result}");
+        bail!("discovery result missing \"components\" key: {result}");
     };
-    let items: Vec<RawItem> = serde_json::from_value(raw)
+    let components = serde_json::from_value(raw)
         .map_err(|e| anyhow::anyhow!("failed to parse discovery components: {e}"))?;
-    normalize(items)
+    Ok(DiscoveryPayload {
+        verify,
+        final_verify,
+        components,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +212,8 @@ pub(crate) struct RawItem {
     #[serde(default)]
     #[allow(dead_code)] // singular alias
     path: String,
+    #[serde(default, deserialize_with = "de_paths")]
+    verify: Vec<String>,
     #[serde(default)]
     tier: String,
     /// Lenient by design ("agent invents, harness decides"): a plausible
@@ -169,17 +307,18 @@ pub(crate) fn normalize(items: Vec<RawItem>) -> Result<Vec<DiscoveredComponent>>
                     existing.paths.push(p.clone());
                 }
             }
+            for v in collect_verify(&it) {
+                if !existing.verify.contains(&v) {
+                    existing.verify.push(v);
+                }
+            }
             // Keep the strongest tier (high > medium > low) and the higher
             // priority so the surviving component reflects agent intent
             // instead of whichever item happened to come first.
-            let new_tier = match it.tier.trim().to_lowercase().as_str() {
-                "high" => "high",
-                "low" => "low",
-                _ => "medium",
-            };
+            let new_tier = crate::checklist::Tier::parse(&it.tier);
             let mut tier_upgraded = false;
-            if tier_rank(new_tier) > tier_rank(&existing.tier) {
-                existing.tier = new_tier.to_string();
+            if new_tier.is_stronger_than(crate::checklist::Tier::parse(&existing.tier)) {
+                existing.tier = new_tier.as_str().to_string();
                 tier_upgraded = true;
             }
             if it.priority > existing.priority {
@@ -192,7 +331,7 @@ pub(crate) fn normalize(items: Vec<RawItem>) -> Result<Vec<DiscoveredComponent>>
             // upgrade — running it on every merge would silently override
             // an explicit priority (low/5 + same-tier dup → 10).
             if tier_upgraded {
-                let floor = tier_default_priority(&existing.tier);
+                let floor = crate::checklist::Tier::parse(&existing.tier).default_priority();
                 if existing.priority < floor {
                     existing.priority = floor;
                 }
@@ -203,11 +342,7 @@ pub(crate) fn normalize(items: Vec<RawItem>) -> Result<Vec<DiscoveredComponent>>
             );
             continue;
         }
-        let tier = match it.tier.trim().to_lowercase().as_str() {
-            "high" => "high",
-            "low" => "low",
-            _ => "medium",
-        };
+        let tier = crate::checklist::Tier::parse(&it.tier);
         let name = if it.name.trim().is_empty() {
             slug.clone()
         } else {
@@ -219,16 +354,18 @@ pub(crate) fn normalize(items: Vec<RawItem>) -> Result<Vec<DiscoveredComponent>>
         let priority = if it.priority > 0 {
             it.priority
         } else {
-            tier_default_priority(tier)
+            tier.default_priority()
         };
         index.insert(slug.clone(), out.len());
+        let verify = collect_verify(&it);
         out.push(DiscoveredComponent {
             slug,
             name,
             description: it.description.trim().to_string(),
             paths,
-            tier: tier.to_string(),
+            tier: tier.as_str().to_string(),
             priority,
+            verify,
         });
     }
     if out.len() < MIN_COMPONENTS {
@@ -246,24 +383,6 @@ pub(crate) fn normalize(items: Vec<RawItem>) -> Result<Vec<DiscoveredComponent>>
     // Truncate after sorting so the highest-priority components survive.
     out.truncate(MAX_COMPONENTS);
     Ok(out)
-}
-
-/// Priority floor implied by a tier (applied when the agent gave none).
-fn tier_default_priority(tier: &str) -> u32 {
-    match tier {
-        "high" => 100,
-        "low" => 10,
-        _ => 50,
-    }
-}
-
-fn tier_rank(tier: &str) -> u8 {
-    match tier {
-        "high" => 3,
-        "medium" => 2,
-        "low" => 1,
-        _ => 0,
-    }
 }
 
 /// Valid component slug: lowercase a-z0-9 hyphen-joined segments. Shared
@@ -370,6 +489,23 @@ fn collect_paths(it: &RawItem) -> Vec<String> {
     out
 }
 
+fn collect_verify(it: &RawItem) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for raw in &it.verify {
+        let cmd = raw.trim();
+        if cmd.is_empty() || cmd.chars().any(|c| c.is_control()) {
+            continue;
+        }
+        if seen.contains(cmd) {
+            continue;
+        }
+        seen.insert(cmd.to_string());
+        out.push(cmd.to_string());
+    }
+    out
+}
+
 /// True when the path starts with a Windows drive-letter prefix
 /// (e.g. `C:/Users/x`) — an absolute path on the agent's machine that
 /// Unix-side checks cannot see.
@@ -471,6 +607,55 @@ mod priority_tests {
         let it: RawItem = serde_json::from_value(item).unwrap();
         let paths = collect_paths(&it);
         assert_eq!(paths, vec!["src/x.rs"]);
+    }
+
+    #[test]
+    fn parse_rejects_truncated_single_object() {
+        let one = serde_json::json!({
+            "slug": "helm-deploy", "name": "Helm", "paths": ["helm"], "tier": "medium"
+        });
+        let err = parse_discovery_payload(&one).unwrap_err().to_string();
+        assert!(err.contains("truncated answer"), "{err}");
+    }
+
+    #[test]
+    fn parse_reads_project_verify_gates() {
+        let v = serde_json::json!({
+            "verify": ["./scripts/check.sh"],
+            "final_verify": ["./scripts/check.sh", "./scripts/e2e.sh"],
+            "components": [
+                {"slug": "core", "name": "Core", "paths": ["src"], "tier": "high"}
+            ]
+        });
+        let p = parse_discovery_payload(&v).unwrap();
+        assert_eq!(p.verify, vec!["./scripts/check.sh"]);
+        assert_eq!(
+            p.final_verify,
+            vec!["./scripts/check.sh", "./scripts/e2e.sh"]
+        );
+        assert_eq!(p.components.len(), 1);
+    }
+
+    #[test]
+    fn verify_commands_round_trip() {
+        let item = serde_json::json!({
+            "slug": "db", "name": "DB", "tier": "high",
+            "paths": ["pkg/db"],
+            "verify": ["pytest pkg/db", "ruff check pkg/db"]
+        });
+        let out = normalize(vec![serde_json::from_value(item).unwrap()]).unwrap();
+        assert_eq!(out[0].verify, vec!["pytest pkg/db", "ruff check pkg/db"]);
+    }
+
+    #[test]
+    fn parse_accepts_components_array() {
+        let v = serde_json::json!({"components": [
+            {"slug": "core", "name": "Core", "paths": ["crates/core"], "tier": "high"},
+            {"slug": "server", "name": "Server", "paths": ["crates/server"], "tier": "high"}
+        ]});
+        let items = parse_discovery_payload(&v).unwrap();
+        assert_eq!(items.components.len(), 2);
+        assert!(items.verify.is_empty());
     }
 
     #[test]

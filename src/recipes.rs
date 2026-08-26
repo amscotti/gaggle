@@ -12,39 +12,41 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../config.toml.example");
 
-const GITIGNORE_MARK: &str = "# gaggle: keep durable config; ignore run state";
+const GITIGNORE_MARK: &str = "# gaggle: ignore the review directory";
 const GITIGNORE_BLOCK: &str = "\
-# gaggle: keep durable config; ignore run state
-.review/*
-!.review/config.toml
-!.review/checklist.md
-!.review/workflows/
-!.review/workflows/**
+# gaggle: ignore the review directory
+.review/
 ";
 
 const NAMES: &[&str] = &[
     "discover.yaml",
+    "discover-validate.yaml",
     "review.yaml",
     "confirm.yaml",
     "fix.yaml",
     "verify.yaml",
+    "gate.yaml",
     "report.yaml",
 ];
 
 const DISCOVER: &str = include_str!("../workflows/discover.yaml");
+const DISCOVER_VALIDATE: &str = include_str!("../workflows/discover-validate.yaml");
 const REVIEW: &str = include_str!("../workflows/review.yaml");
 const CONFIRM: &str = include_str!("../workflows/confirm.yaml");
 const FIX: &str = include_str!("../workflows/fix.yaml");
 const VERIFY: &str = include_str!("../workflows/verify.yaml");
+const GATE: &str = include_str!("../workflows/gate.yaml");
 const REPORT: &str = include_str!("../workflows/report.yaml");
 
 fn source(name: &str) -> Result<&'static str> {
     match name {
         "discover.yaml" => Ok(DISCOVER),
+        "discover-validate.yaml" => Ok(DISCOVER_VALIDATE),
         "review.yaml" => Ok(REVIEW),
         "confirm.yaml" => Ok(CONFIRM),
         "fix.yaml" => Ok(FIX),
         "verify.yaml" => Ok(VERIFY),
+        "gate.yaml" => Ok(GATE),
         "report.yaml" => Ok(REPORT),
         other => bail!("unknown embedded recipe: {other}"),
     }
@@ -120,78 +122,72 @@ fn materialize_embedded(name: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Detect verify commands from repo markers.
-///
-/// Honest defaults: only claim a command when the repo actually supports
-/// it. For package.json we require a `test` script (else `npm test` fails
-/// with 'Missing script: test'). When NO language is recognized we emit an
-/// explicitly-failing placeholder (`false`) rather than a wrong-language
-/// command — a verify gate that spuriously fails every fix is preferable
-/// to one that silently fakes green or blames the wrong toolchain; init
-/// warns loudly and the config comment tells the user to edit it.
-pub fn detect_verify_commands(repo: &Path) -> Vec<String> {
-    if repo.join("go.mod").exists() {
-        vec!["go test ./...".to_string()]
-    } else if repo.join("Cargo.toml").exists() {
-        vec!["cargo build".to_string(), "cargo test".to_string()]
-    } else if repo.join("package.json").exists() {
-        if package_json_has_test_script(repo) {
-            vec!["npm test".to_string()]
-        } else {
-            vec![UNKNOWN_REPO_PLACEHOLDER.to_string()]
-        }
-    } else if repo.join("pyproject.toml").exists()
-        || repo.join("pytest.ini").exists()
-        || repo.join("setup.py").exists()
-    {
-        vec!["pytest".to_string()]
-    } else {
-        vec![UNKNOWN_REPO_PLACEHOLDER.to_string()]
+/// Config text for a fresh `.review/config.toml`. Discovery copies the
+/// repo's real test commands into `verify` / `final_verify`. Until then
+/// the placeholder fails closed.
+pub fn default_config_for(_repo: &Path) -> String {
+    DEFAULT_CONFIG.to_string()
+}
+
+/// Create `.review/config.toml` from the baked-in template when missing.
+pub fn ensure_config(repo: &Path) -> Result<()> {
+    let path = repo.join(".review/config.toml");
+    if path.exists() {
+        return Ok(());
     }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, default_config_for(repo))?;
+    Ok(())
 }
 
-/// Placeholder for unrecognized repos: fails with a message pointing at
-/// the config instead of running a wrong-language toolchain.
-const UNKNOWN_REPO_PLACEHOLDER: &str =
-    "false # gaggle: no verify command detected — edit verify in .review/config.toml";
-
-/// Minimal check that package.json declares a REAL `test` script. An empty
-/// string (or non-string) value would make `npm test` run an empty command
-/// and exit 0 — a silently fake-green verify gate.
-fn package_json_has_test_script(repo: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(repo.join("package.json")) else {
-        return false;
+/// Write discovery's project-wide gate commands into `.review/config.toml`.
+/// Empty `verify` leaves the placeholder and warns. Empty `final_verify`
+/// copies `verify` so both gates match unless the agent named a slower one.
+pub fn apply_discovered_gates(
+    repo: &Path,
+    verify: &[String],
+    final_verify: &[String],
+) -> Result<()> {
+    if verify.is_empty() {
+        eprintln!(
+            "  ⚠ discovery did not name project-wide verify commands — \
+             edit `verify` in .review/config.toml before `gaggle run`"
+        );
+        return Ok(());
+    }
+    let path = repo.join(".review/config.toml");
+    let text = fs::read_to_string(&path)?;
+    let final_cmds = if final_verify.is_empty() {
+        verify
+    } else {
+        final_verify
     };
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| {
-            v.get("scripts")
-                .and_then(|s| s.get("test"))
-                .and_then(|t| t.as_str())
-                .map(|s| !s.trim().is_empty())
-        })
-        .unwrap_or(false)
+    let text = replace_array_key(&text, "verify", verify);
+    let text = replace_array_key(&text, "final_verify", final_cmds);
+    fs::write(&path, text)?;
+    println!("  project verify: {}", verify.join(" ; "));
+    if final_cmds != verify {
+        println!("  final verify: {}", final_cmds.join(" ; "));
+    }
+    Ok(())
 }
 
-/// Config text for a fresh `.review/config.toml`: `config.toml.example`
-/// (DEFAULT_CONFIG) with its `verify = [...]` line swapped for commands
-/// detected from the repo. Keeping the example as the single template
-/// means its comments/settings always match what init writes.
-pub fn default_config_for(repo: &Path) -> String {
-    let cmds = detect_verify_commands(repo);
-    let quoted: Vec<String> = cmds.iter().map(|c| format!("\"{c}\"")).collect();
-    let out = DEFAULT_CONFIG;
-    let new_line = format!("verify = [{}]", quoted.join(", "));
-    // Walk lines (not byte offsets): `lines().map(|l| l.len() + 1)` assumes
-    // LF, so on a CRLF checkout (Windows `core.autocrlf`) the replacement
-    // landed mid-comment. `split_inclusive` keeps the original ending.
+fn replace_array_key(text: &str, key: &str, cmds: &[String]) -> String {
+    let quoted: Vec<String> = cmds
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    let new_line = format!("{key} = [{}]", quoted.join(", "));
+    let active = format!("{key} = [");
+    let commented = format!("# {key} = [");
     let mut result = String::new();
     let mut replaced = false;
-    for line in out.split_inclusive('\n') {
+    for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        let is_verify = content.trim_start_matches('#').trim() == "verify = []"
-            || content.starts_with("verify = [");
-        if is_verify && !replaced {
+        let trimmed = content.trim_start();
+        if !replaced && (trimmed.starts_with(&active) || trimmed.starts_with(&commented)) {
             replaced = true;
             result.push_str(&new_line);
             if line.ends_with("\r\n") {
@@ -204,9 +200,6 @@ pub fn default_config_for(repo: &Path) -> String {
         }
     }
     if !replaced {
-        // The example template drifted (no verify line) — append so
-        // the config is still valid rather than silently unverified.
-        eprintln!("  ⚠ config.toml.example has no `verify = [` line — appending one");
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
@@ -216,60 +209,15 @@ pub fn default_config_for(repo: &Path) -> String {
     result
 }
 
-/// Create `.review/config.toml` from a language-detected default when missing.
-pub fn ensure_config(repo: &Path) -> Result<()> {
-    let path = repo.join(".review/config.toml");
-    if path.exists() {
-        return Ok(());
-    }
-    if detect_verify_commands(repo)
-        .iter()
-        .any(|c| c == UNKNOWN_REPO_PLACEHOLDER)
-    {
-        eprintln!(
-            "  ⚠ no verify command recognized for this repo — writing a FAILING placeholder; \
-             edit `verify` in .review/config.toml before `gaggle run`"
-        );
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, default_config_for(repo))?;
-    Ok(())
-}
-
-/// Append gaggle's `.review/` gitignore rules when the repo does not
-/// already handle that directory correctly.
+/// Append gaggle's `.review/` gitignore rule when the repo does not
+/// already ignore that directory.
 pub fn ensure_gitignore(repo: &Path) -> Result<()> {
     let path = repo.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
     if gitignore_has_review_rules(&existing) {
         return Ok(());
     }
-    // A BARE `.review` (or `/.review`, `.review/`, `/.review/`) entry
-    // ignores the directory itself — and git cannot re-include files whose
-    // parent directory is excluded, so our negations (`!.review/config.toml`
-    // etc.) would be dead rules and the durable config would stay
-    // untrackable. Replace the bare entry with the proper block.
-    let bare_variants = [".review", "/.review", ".review/", "/.review/"];
-    let has_bare = existing.lines().any(|l| bare_variants.contains(&l.trim()));
     let mut out = existing;
-    if has_bare {
-        eprintln!(
-            "  ⚠ .gitignore ignores `.review` as a whole directory — git cannot re-include \
-             files under it; replacing that entry with keep-config rules"
-        );
-        // Drop the bare lines (and any trailing blank duplication), then
-        // append the full block.
-        out = out
-            .lines()
-            .filter(|l| !bare_variants.contains(&l.trim()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !out.is_empty() {
-            out.push('\n');
-        }
-    }
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
@@ -281,30 +229,23 @@ pub fn ensure_gitignore(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-/// True when the existing gitignore already covers `.review` the way the
-/// keep-config block does (`.review/*` + negations) — i.e. appending would
-/// be redundant. Bare directory-only entries do NOT count (see
-/// [`ensure_gitignore`]).
+/// True when `.review/` is already ignored (directory entry, contents
+/// glob, or a prior gaggle/sift marker). Appending would be redundant.
 fn gitignore_has_review_rules(text: &str) -> bool {
-    // LEGACY_MARK: repos bootstrapped before the sift→gaggle rename carry the
-    // old marker comment atop an identical rule block — treat it as present so
-    // we never append a second block.
     const LEGACY_MARK: &str = "# sift: keep durable config; ignore run state";
-    if text.contains(GITIGNORE_MARK) || text.contains(LEGACY_MARK) {
+    const LEGACY_GAGGLE_MARK: &str = "# gaggle: keep durable config; ignore run state";
+    if text.contains(GITIGNORE_MARK)
+        || text.contains(LEGACY_MARK)
+        || text.contains(LEGACY_GAGGLE_MARK)
+    {
         return true;
     }
-    // `.review/*` ignores only the CONTENTS, so negations CAN re-include —
-    // but only if negations actually exist. A lone `.review/*` with no
-    // `!.review/…` lines keeps the durable config ignored forever; append
-    // our full block in that case.
-    let has_star = text
-        .lines()
-        .any(|l| matches!(l.trim(), ".review/*" | "/.review/*"));
-    let has_negation = text.lines().any(|l| {
-        let t = l.trim();
-        t.starts_with("!") && (t.contains(".review/") || t == "!.review")
-    });
-    has_star && has_negation
+    text.lines().any(|l| {
+        matches!(
+            l.trim(),
+            ".review" | "/.review" | ".review/" | "/.review/" | ".review/*" | "/.review/*"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -372,15 +313,25 @@ mod tests {
     }
 
     #[test]
-    fn detect_go_vs_cargo() {
+    fn apply_discovered_gates_writes_both_keys() {
         let repo = temp_repo();
-        fs::write(repo.join("go.mod"), "module x\n").unwrap();
-        assert_eq!(detect_verify_commands(&repo), vec!["go test ./..."]);
-        fs::remove_file(repo.join("go.mod")).unwrap();
-        fs::write(repo.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
-        assert_eq!(
-            detect_verify_commands(&repo),
-            vec!["cargo build", "cargo test"]
+        fs::create_dir_all(repo.join(".review")).unwrap();
+        fs::write(
+            repo.join(".review/config.toml"),
+            "verify = [\"false\"]\n# final_verify = [\"./slow.sh\"]\n",
+        )
+        .unwrap();
+        apply_discovered_gates(&repo, &["./scripts/check.sh".to_string()], &[]).unwrap();
+        let cfg = fs::read_to_string(repo.join(".review/config.toml")).unwrap();
+        assert!(
+            cfg.lines()
+                .any(|l| l == "verify = [\"./scripts/check.sh\"]"),
+            "{cfg}"
+        );
+        assert!(
+            cfg.lines()
+                .any(|l| l == "final_verify = [\"./scripts/check.sh\"]"),
+            "{cfg}"
         );
         let _ = fs::remove_dir_all(&repo);
     }
@@ -393,7 +344,8 @@ mod tests {
         ensure_gitignore(&repo).unwrap();
         let text = fs::read_to_string(repo.join(".gitignore")).unwrap();
         assert_eq!(text.matches(GITIGNORE_MARK).count(), 1);
-        assert!(text.contains("!.review/checklist.md"));
+        assert!(text.contains(".review/"));
+        assert!(!text.contains("!.review/checklist.md"));
         let _ = fs::remove_dir_all(&repo);
     }
 }
@@ -403,21 +355,20 @@ mod gitignore_negation_tests {
     use super::*;
 
     #[test]
-    fn lone_review_star_does_not_count_without_negations() {
-        // A lone `.review/*` keeps config untracked — must NOT be treated
-        // as covered; ensure_gitignore should append the keep-config block.
-        assert!(!gitignore_has_review_rules(".review/*\n/target\n"));
-        // With a negation, the user has handled it deliberately.
+    fn any_review_ignore_counts_as_covered() {
+        assert!(gitignore_has_review_rules(".review/\n/target\n"));
+        assert!(gitignore_has_review_rules(".review\n"));
+        assert!(gitignore_has_review_rules(".review/*\n/target\n"));
         assert!(gitignore_has_review_rules(
             ".review/*\n!.review/config.toml\n"
         ));
         assert!(gitignore_has_review_rules(
-            "/.review/*\n!.review/checklist.md\n"
+            "# gaggle: ignore the review directory\n.review/\n"
         ));
-        // Marker comment always counts (ours or the legacy sift one).
         assert!(gitignore_has_review_rules(
             "# gaggle: keep durable config; ignore run state\n.review/*\n"
         ));
+        assert!(!gitignore_has_review_rules("/target\n"));
     }
 }
 
@@ -426,23 +377,25 @@ mod final_verify_template_tests {
     use super::*;
 
     #[test]
-    fn default_config_swaps_verify_not_final_verify() {
+    fn default_config_is_language_neutral() {
         let dir = std::env::temp_dir().join(format!("gaggle-fv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
         let cfg = default_config_for(&dir);
-        // The ACTIVE verify line carries the detected command.
-        // Line-based: a CRLF checkout must not fail a `\n…\n` substring check.
         assert!(
-            cfg.lines().any(|l| l == "verify = [\"go test ./...\"]"),
+            cfg.lines().any(|l| l == "verify = [\"false\"]"),
             "verify line wrong:\n{cfg}"
         );
-        // The commented final_verify example survives untouched.
         assert!(
-            cfg.contains(
-                "# final_verify = [\"cargo build --workspace\", \"cargo test --workspace\"]"
-            ),
+            cfg.contains("# final_verify = [\"./scripts/e2e.sh\"]"),
             "final_verify example corrupted:\n{cfg}"
+        );
+        assert!(
+            cfg.lines().any(|l| l == "# verify_stall_secs = 900"),
+            "verify_stall_secs example missing:\n{cfg}"
+        );
+        assert!(
+            cfg.lines().any(|l| l == "# verify_timeout_secs = 14400"),
+            "verify_timeout_secs example missing:\n{cfg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

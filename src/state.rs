@@ -24,13 +24,15 @@ pub enum Phase {
     Verifying,
     Committing,
     Done,
-    /// Quarantine. A component enters this phase when any active step fails.
+    /// Quarantine. A component enters this phase only after its attempt
+    /// budget is spent (goose retries + fix cycles). A single goose flake
+    /// or a red verify is not enough — those retry or send the fixer.
     /// It is *not* automatically requeued: `State::next` only selects
     /// `Pending` components, so a failed component stays parked here until an
     /// external caller explicitly requeues it via the `Failed → Pending`
     /// transition (the only legal path out of `Failed`). This is intentional —
     /// quarantine lets the engine continue with the remaining components
-    /// rather than aborting on the first failure.
+    /// rather than stalling the whole run on one slice.
     Failed,
 }
 
@@ -61,6 +63,10 @@ pub struct ComponentState {
     /// Repo-relative paths this component covers (from AI discovery).
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Per-component verify commands from the checklist. Empty = repo-wide
+    /// `verify` list in `.review/config.toml`.
+    #[serde(default)]
+    pub verify: Vec<String>,
     /// Short hash of this component's fix commit, when one was kept
     /// (commit-on-green). Absent = nothing was committed for it.
     #[serde(default)]
@@ -262,13 +268,21 @@ impl State {
                     if !c.paths.is_empty() {
                         existing.paths = c.paths.clone();
                     }
+                    existing.verify = c.verify.clone();
                     if c.done && existing.phase == Phase::Pending {
                         existing.phase = Phase::Done;
                         if existing.detail.is_empty() {
                             existing.detail = "marked done in checklist".to_string();
                         }
-                    } else if !c.done && existing.phase == Phase::Done {
+                    } else if !c.done && matches!(existing.phase, Phase::Done | Phase::Failed) {
+                        // Unchecking the checklist is a full redo of that
+                        // slice: Done *and* quarantined rows go back to
+                        // pending. Failed used to stick until `gaggle
+                        // requeue`, which made a checklist reset skip the
+                        // components that most needed another pass.
                         existing.phase = Phase::Pending;
+                        existing.findings = 0;
+                        existing.detail = String::new();
                     }
                 }
                 None => {
@@ -286,6 +300,7 @@ impl State {
                                 String::new()
                             },
                             paths: c.paths.clone(),
+                            verify: c.verify.clone(),
                             commit: None,
                         },
                     );
@@ -394,6 +409,7 @@ mod tests {
             tier: "high".into(),
             done: true,
             paths: vec!["src/a.rs".into()],
+            verify: vec![],
         }];
         let mut s = State::default();
         s.sync(&comps);
@@ -411,6 +427,7 @@ mod tests {
             tier: "high".into(),
             done: true,
             paths: vec![],
+            verify: vec![],
         }]);
         s.sync(&[Component {
             slug: "a".into(),
@@ -418,8 +435,38 @@ mod tests {
             tier: "high".into(),
             done: false,
             paths: vec![],
+            verify: vec![],
         }]);
         assert_eq!(s.get("a").unwrap().phase, Phase::Pending);
+    }
+
+    #[test]
+    fn sync_uncheck_requeues_failed() {
+        let mut s = State::default();
+        s.sync(&[Component {
+            slug: "a".into(),
+            name: "A".into(),
+            tier: "high".into(),
+            done: false,
+            paths: vec![],
+            verify: vec![],
+        }]);
+        transition(&mut s, "a", Phase::Reviewing).unwrap();
+        transition(&mut s, "a", Phase::Failed).unwrap();
+        s.set_findings("a", 2).unwrap();
+        s.set_detail("a", "goose timed out").unwrap();
+        s.sync(&[Component {
+            slug: "a".into(),
+            name: "A".into(),
+            tier: "high".into(),
+            done: false,
+            paths: vec![],
+            verify: vec![],
+        }]);
+        let row = s.get("a").unwrap();
+        assert_eq!(row.phase, Phase::Pending);
+        assert_eq!(row.findings, 0);
+        assert!(row.detail.is_empty());
     }
 }
 
