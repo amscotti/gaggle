@@ -2,7 +2,10 @@
 # discover — AI component discovery recipe (gaggle)
 # ONE agent invocation that explores the repo and invents a component
 # checklist. The harness validates the JSON (slug/paths/tier/limits) — the
-# agent never touches state. Ported from the Go original's discover.tmpl.
+# agent never touches state.
+#
+# Language-agnostic: the agent inspects whatever tree is here. The harness
+# does not enumerate packages, crates, or modules for you.
 #
 # Model: NOT pinned here — the harness driver pins provider/model from
 # .review/config.toml when set, else goose uses its configured default.
@@ -15,50 +18,92 @@ description: Invent a component checklist for the repo, returned as JSON
 instructions: |
   Create a Gaggle component checklist for this repository ({{project_name}}).
 
+  You are the one who understands the repo. List directories, open the
+  build/workspace manifest (whatever language it is), open source files,
+  and decide the components. Do not stop after the first folder you see.
+
   A **component** is one logical segment of the codebase that should be
-  reviewed and fixed on its own: a package, module, layer, command group, or
-  cohesive subsystem (with its tests when they live nearby). Not the whole
-  repo, not every file.
+  reviewed and fixed on its own: a package, module, layer, command group,
+  library, app, or cohesive subsystem (with its tests when they live
+  nearby). Not the whole repo. Not every file. Not "the docs folder"
+  instead of the code.
+
+  ## How to inspect (do this before writing JSON)
+  1. List the repository root. Note every first-party source tree
+     (common names: src, lib, app, apps, packages, crates, cmd, internal,
+     services, modules — but use whatever THIS repo actually has).
+  2. Open the workspace/build manifest if one exists. If it lists
+     members/packages/modules, each member is a component unless two
+     members are clearly one subsystem.
+  3. Split a huge package further when it has distinct ownership
+     (auth vs routing vs handlers vs adapters).
+  4. Open the docs (README, docs/, manuals, architecture notes). They
+     are not a component. Use them as reference: what the system is
+     supposed to do, which packages own which behavior, what "working"
+     means. When a doc describes a component, say so in that
+     component's description so later review/fix keeps the doc accurate.
+  5. After the source is covered, add CI/CD and packaging if present.
+     Look for workflow dirs wherever this repo keeps them: .github/,
+     .circleci/, .gitlab-ci.yml, .buildkite/, Jenkinsfile, .drone.yml,
+     azure-pipelines.yml, build.zig.zon, Makefile/Justfile used as a
+     gate — use whatever THIS repo actually has. Helm, Docker, and
+     examples are extras AFTER source and CI — never the only items,
+     never a substitute for missing libraries.
+
+  A repo with several first-party packages MUST produce several
+  components. Returning one component (especially helm, examples, or
+  docs) for a multi-package tree is an incomplete answer. One component
+  is only correct when the repo is a single small package.
 
   ## Component fields
   | field | meaning |
   |-------|--------|
   | slug | stable id: lowercase a-z0-9 segments joined by hyphens |
   | name | short human title |
-  | description | responsibility: what it owns, who uses it, what must hold (2-4 sentences). When behavior is user-facing, note that fixes should keep related docs accurate. |
+  | description | responsibility: what it owns, who uses it, what must hold (2-4 sentences). Name related docs the reviewer should open. When behavior is user-facing, note that fixes should keep those docs accurate. |
   | paths | repo-relative dirs/files this component covers (use /; no ..) |
+  | verify | optional. Shell command(s) THIS repo already uses to check THIS slice. Copy from CI / the package's own test invocation, including any flags those tests need. Omit if the project only has one full-suite gate — the harness then uses the project-wide list. Do not invent a command the repo does not run. |
   | tier | high / medium / low — how critical mistakes here are |
   | priority | integer — relative importance of spending review/fix effort (higher first) |
 
-  ## Priority and tier (spend time on what matters)
-  Runs often process every component eventually; priority ranks importance,
-  not a strict dependency graph. Put the highest priorities on correctness,
-  safety, data, and core orchestration — the places bugs hurt most. Use
-  distinct integers within a tier so ties do not hide ranking.
+  ## Priority and tier
+  Runs often process every component eventually; priority ranks
+  importance, not a strict dependency graph. Put the highest priorities
+  on correctness, safety, data, and core orchestration. Use distinct
+  integers within a tier so ties do not hide ranking.
   Suggested bands: high 80-100 (spread), medium 40-70, low 5-25.
-  Prefer higher priority for: security boundaries, persistence, agent
-  drivers, orchestration state machines, anything that mutates repos/git.
-  Prefer lower priority for: optional integrations, pure heuristics, polish.
+  Prefer higher priority for: security boundaries, persistence, request
+  pipelines, anything that mutates user data or money.
+  Prefer lower priority for: optional integrations, polish, examples.
 
   ## Quality bar
   - Split by logical ownership, not one giant root and not one component per file.
-  - Split large entrypoints: a big CLI/main that wires many commands and the
-    run loop should become several components, with paths pointing at the
-    specific files each owns.
+  - Split large entrypoints: a big CLI/main that wires many commands should
+    become several components, with paths pointing at the files each owns.
   - Prefer directory-level paths; use file-level paths when splitting one package.
-  - Include the package's tests when they live nearby.
-  - Include CI and build tooling as components when present (workflows/,
-    Cargo.toml/go.mod build config, packaging, .golangci.yml). Review that
-    gates match how the project actually builds and tests.
-  - Empty command packages (cmd/<name>/ with no source files) and missing
-    mains that build scripts reference are holes — put them on a CLI/build
-    component so they get an entrypoint.
-  - Do NOT invent a standalone "docs only" component. Docs stay in sync as
-    part of fixing the owning components (say so in descriptions).
-  - Skip generated/vendor noise (build/, node_modules/, target/, .gradle/, bin/).
-  - Typical medium repo: about 6-18 components after splitting large CLIs and CI.
+  - Every path must exist. List the directory (or open the file) before
+    you emit it — do not guess a package or class name.
+  - When you split one package, sibling paths must not nest: if component
+    B owns a file under folder F, component A must not also own F.
+  - Include the package's tests when they live nearby. If you split a
+    package, attach tests to the slice they cover (or keep the whole
+    test tree on one owner — not all tests on one sibling and none on
+    the other).
+  - Include CI/CD as a component when present (.github/workflows,
+    .circleci, GitLab CI, Buildkite, Jenkins, or the equivalent here).
+    Review that the gates match how the project actually builds and tests.
+  - Empty command packages and missing mains that build scripts reference
+    are holes — put them on a CLI/build component.
+  - Do NOT invent a standalone "docs only" component. Still READ the docs
+    during discovery. Point each component at the docs that describe it
+    (description text is enough; do not put docs/ on the component's
+    paths unless the component's job is the doc toolchain itself).
+  - Skip generated/vendor noise (build/, node_modules/, target/, dist/, vendor/).
+  - Typical medium repo: about 6-18 components. Multi-package trees are
+    often at the high end of that (or more, up to the harness cap).
   - Every component needs non-empty paths and a real description.
-  - tier is the string high|medium|low; priority is an integer (not a string).
+  - tier is high|medium|low; priority is an integer (not a string).
+
   EXISTING CHECKLIST: open and read the file at {{existing}}.
   If that file says there is no existing checklist, invent fresh slugs.
   Otherwise you are RE-RUNNING discovery — reconcile as follows.
@@ -74,18 +119,36 @@ instructions: |
   subset. When in doubt about an existing component, keep it (dropping a
   live component is worse than keeping a stale one).
 
-  ## Output
-  Inspect the repo as needed (read files, list dirs, check build config),
-  then answer with ONLY a JSON object of the form shown (optional markdown fence):
+  ## Project-wide verify (required)
+  Open CI, README, Makefile, scripts, or whatever THIS repo uses as
+  "the tests passed". Copy those command(s) into top-level `verify`.
+  That is the gate the harness runs after every fix. Copy, do not invent.
+  If the repo has one gate, put the same commands in `final_verify`.
+  Only make `final_verify` different when the repo itself has a slower
+  extra suite the CI actually runs. If you cannot find a command, omit
+  `verify` (the harness will fail closed until a human edits config).
 
-  {"components": [
-    {"slug": "loop-engine", "name": "Review/fix loop", "description": "Owns the state machine and orchestration. Called by main; must persist state between phases.", "paths": ["src/loop_engine.rs"], "tier": "high", "priority": 100}
+  ## Output
+  After inspection, emit the FULL payload in one shot. Do not stream one
+  component and stop.
+
+  The payload MUST be an object with `verify` (project-wide commands)
+  and `components` (an ARRAY of every component). Never return a single
+  component as the top-level JSON. Never return {"components": [one item]}
+  unless the repo truly has one source package.
+
+  Shape (copy the structure, not the slugs, paths, or commands):
+
+  {"verify": ["<the command CI or README uses to test the whole project>"], "final_verify": ["<same, or a slower extra suite if CI has one>"], "components": [
+    {"slug": "core", "name": "Core library", "description": "Shared types and domain logic used by the rest of the system.", "paths": ["packages/core"], "tier": "high", "priority": 100},
+    {"slug": "api", "name": "HTTP API", "description": "Request pipeline, auth, handlers. Must stay correct under load.", "paths": ["packages/api"], "tier": "high", "priority": 95},
+    {"slug": "adapters", "name": "External adapters", "description": "Talks to upstream services. Failures here fail user traffic.", "paths": ["packages/adapters"], "tier": "high", "priority": 90}
   ]}
 
-  End your response with exactly one JSON line of the form:
-  {"components": [...]}
+  End your response with exactly one JSON line:
+  {"verify": [...], "final_verify": [...], "components": [ {...}, {...}, ... ]}
   (nothing after it)
-prompt: "Discover the component checklist for this repository; end with one JSON line: {\"components\": [...]}"
+prompt: "Inspect source, docs, and CI. Copy the repo's real project-wide test command(s) into verify/final_verify. Emit a component for EVERY first-party package/module/library plus CI/CD if present. End with one JSON line: {\"verify\": [...], \"final_verify\": [...], \"components\": [/* many objects */]}"
 parameters:
   - key: project_name
     input_type: string

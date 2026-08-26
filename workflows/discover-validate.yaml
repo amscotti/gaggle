@@ -1,0 +1,59 @@
+# =============================================================================
+# discover-validate — second pass after AI discovery (gaggle)
+# Reads the proposed checklist and checks it against the repo. Returns the
+# full payload, corrected if needed. The harness applies this result.
+#
+# Model: same as discover (stem maps to that phase). Not pinned here.
+# =============================================================================
+version: 1.0.0
+id: discover-validate
+title: "Validate discovery for {{project_name}}"
+description: Checks the proposed component list against the repo and corrects it
+instructions: |
+  A first-pass discovery proposed a component checklist and project-wide
+  verify commands for this repository ({{project_name}}). Your job is to
+  check that proposal against the tree and return a correct version.
+
+  The proposal is in:
+  {{proposal}}
+  (Open that file and read it.)
+
+  Walk the repository. For every component in the proposal:
+
+  1. Every path must exist. If a path is missing, find the real file or
+     directory (list the parent) and substitute it, or drop that path if
+     nothing matches.
+  2. Sibling components must not nest. If A owns a folder and B owns a
+     file inside that folder, narrow A's paths so they no longer contain
+     B's, or merge the two if they are not really separate.
+  3. Tests belong with the code they cover. If one slice of a package
+     was given all the tests and another slice none, move the tests (or
+     keep the whole test tree on a single owner).
+  4. Project-wide `verify` / `final_verify` must be commands this repo
+     actually runs (CI, README, scripts). If the proposal invented a
+     command, replace it with the real one. If the repo has one gate,
+     both lists may be the same.
+
+  Do not invent a new architecture. Keep slugs when they still fit.
+  Add a component only if a first-party package or CI/CD area is missing.
+  Drop a component only if its code is not there.
+
+  ## Report
+  End with EXACTLY ONE JSON line — the full corrected payload, same
+  shape as discovery. Set ok true when you made no material change.
+
+  {"ok": true|false, "verify": [...], "final_verify": [...], "components": [ {...}, ... ]}
+prompt: "Validate the discovery proposal at {{proposal}} against the repo; end with one JSON line: {\"ok\": true|false, \"verify\": [...], \"final_verify\": [...], \"components\": [...]}"
+parameters:
+  - key: project_name
+    input_type: string
+    requirement: optional
+    default: "gaggle"
+    description: Short label for the repo
+  - key: proposal
+    input_type: string
+    requirement: required
+    description: Path to the first-pass discovery JSON
+extensions:
+  - type: builtin
+    name: developer

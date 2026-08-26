@@ -35,10 +35,12 @@ instructions: |
     error in the touched file, a test it broke, a lint violation). This is
     the common case — the fixer must fix it.
   - **environmental**: the failure is NOT attributable to the fixer's
-    changes (missing tool, network, pre-existing failure present before
-    this component's work, flaky test). Rare — call this only with
-    evidence (e.g. the failing file is untouched by the fixer, or the
-    command is unavailable).
+    changes (missing tool, network, a hang the harness already classified
+    as a stall). Rare — call this only with evidence (e.g. the command
+    is unavailable). A test the fixer did not write, or a failure that
+    looks "pre-existing", is still **fix** when the diagnostics name
+    code or a fixture in this repo — the fixer must make the command
+    pass, not park the component.
 
   ## Report
   End with EXACTLY ONE JSON line — nothing after it:

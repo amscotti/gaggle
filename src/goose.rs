@@ -79,12 +79,16 @@ pub fn model_pin_for(repo: &Path, phase: &str) -> Result<ModelPin> {
     if let Some(m) = base {
         if let Some(table) = m.as_table() {
             for key in table.keys() {
-                if !KNOWN_PHASES.contains(&key.as_str()) && key != "provider" && key != "model" {
+                if RecipePhase::from_stem(key).is_none() && key != "provider" && key != "model" {
                     bail!(
                         "`[model.{key}]` in {} is not a known phase — expected one of: {} \
                          (or the base keys provider/model)",
                         cfg.display(),
-                        KNOWN_PHASES.join(", ")
+                        RecipePhase::ALL
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
             }
@@ -137,30 +141,92 @@ pub fn model_pin_for(repo: &Path, phase: &str) -> Result<ModelPin> {
     Ok(ModelPin { provider, model })
 }
 
-/// Recipe-name-derived phases that may carry their own model section.
-/// `run_recipe` derives the phase from the recipe file stem; repo
-/// overrides must keep the same file names, so this set is closed.
-pub const KNOWN_PHASES: &[&str] = &["discover", "review", "confirm", "fix", "verify", "report"];
+/// Recipe file stem → phase. Repo overrides must keep these file names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipePhase {
+    Discover,
+    Review,
+    Confirm,
+    Fix,
+    Verify,
+    Gate,
+    Report,
+}
+
+impl RecipePhase {
+    pub const ALL: &[RecipePhase] = &[
+        RecipePhase::Discover,
+        RecipePhase::Review,
+        RecipePhase::Confirm,
+        RecipePhase::Fix,
+        RecipePhase::Verify,
+        RecipePhase::Gate,
+        RecipePhase::Report,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discover => "discover",
+            Self::Review => "review",
+            Self::Confirm => "confirm",
+            Self::Fix => "fix",
+            Self::Verify => "verify",
+            Self::Gate => "gate",
+            Self::Report => "report",
+        }
+    }
+
+    pub fn from_stem(s: &str) -> Option<Self> {
+        match s {
+            "discover" | "discover-validate" => Some(Self::Discover),
+            "review" => Some(Self::Review),
+            "confirm" => Some(Self::Confirm),
+            "fix" => Some(Self::Fix),
+            "verify" => Some(Self::Verify),
+            "gate" => Some(Self::Gate),
+            "report" => Some(Self::Report),
+            _ => None,
+        }
+    }
+
+    pub const fn thinking_effort(self) -> ThinkingEffort {
+        match self {
+            Self::Discover => ThinkingEffort::Low,
+            _ => ThinkingEffort::Medium,
+        }
+    }
+}
+
+/// Goose thinking-effort pin for harness children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
 
 /// Backwards-compatible base-pin lookup (no phase overrides).
 pub fn model_pin(repo: &Path) -> Result<ModelPin> {
     model_pin_for(repo, "")
 }
 
-/// Derive the phase name from a recipe path (`…/fix.yaml` → "fix").
-/// Unknown stems (a custom-named recipe) resolve to "" = base pin only.
-fn phase_from_recipe(recipe: &Path) -> String {
+/// Derive the phase from a recipe path (`…/fix.yaml` → Fix).
+/// Unknown stems resolve to None = base pin only.
+fn phase_from_recipe(recipe: &Path) -> Option<RecipePhase> {
     recipe
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| {
-            if KNOWN_PHASES.contains(&s) {
-                s.to_string()
-            } else {
-                String::new()
-            }
-        })
-        .unwrap_or_default()
+        .and_then(RecipePhase::from_stem)
 }
 
 /// Human-readable effective model for CLI display (`gaggle model`, run
@@ -181,7 +247,8 @@ pub fn effective_model(repo: &Path) -> String {
     }
     // Per-phase overrides, in canonical phase order.
     let mut overrides: Vec<String> = Vec::new();
-    for phase in KNOWN_PHASES {
+    for phase in RecipePhase::ALL {
+        let phase = phase.as_str();
         if let Ok(pin) = model_pin_for(repo, phase) {
             if (pin.provider != base.provider) || (pin.model != base.model) {
                 overrides.push(format!("{phase}: {}", fmt(&pin)));
@@ -194,28 +261,24 @@ pub fn effective_model(repo: &Path) -> String {
     out
 }
 
-/// Wall-clock ceiling for one goose recipe run. Sized for the slowest
-/// legit phase observed in the wild: a 120-turn fix on a large component
-/// of a 16k-LOC workspace ran ~35 min (redacter). 60 min leaves generous
-/// headroom; a hung subprocess must not block the driver forever.
-/// Override with `GAGGLE_GOOSE_TIMEOUT_SECS`.
-const GOOSE_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-
-fn goose_run_timeout() -> std::time::Duration {
+/// Optional wall-clock ceiling for one goose recipe run. Unset = none.
+/// A long fix on a large component is legitimate work; waiting on the
+/// provider looks idle, so a default timeout (or I/O+CPU stall) would
+/// kill healthy agents. Override with `GAGGLE_GOOSE_TIMEOUT_SECS` only
+/// when you have a CI budget. `0` is also none.
+fn goose_run_timeout() -> Option<std::time::Duration> {
     match std::env::var("GAGGLE_GOOSE_TIMEOUT_SECS") {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(secs) => std::time::Duration::from_secs(secs.max(1)),
-            // A user-specified override that fails to parse must not be
-            // silently ignored — warn (but keep the run going on default).
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
             Err(_) => {
                 eprintln!(
-                    "  ⚠ GAGGLE_GOOSE_TIMEOUT_SECS={raw:?} is not a number of seconds — using default {}s",
-                    GOOSE_RUN_TIMEOUT.as_secs()
+                    "  ⚠ GAGGLE_GOOSE_TIMEOUT_SECS={raw:?} is not a number of seconds — ignoring (no timeout)"
                 );
-                GOOSE_RUN_TIMEOUT
+                None
             }
         },
-        Err(_) => GOOSE_RUN_TIMEOUT,
+        Err(_) => None,
     }
 }
 
@@ -241,6 +304,49 @@ fn kill_process_group(child: &mut std::process::Child) {
         }
     }
     let _ = child.kill();
+}
+
+/// Goose's recipe-load banner (title, description, params) on stderr is
+/// chatter, not a failure. Strip a leading banner; return any lines after
+/// it (warnings, rust traces) so the caller can still surface those.
+fn leftover_goose_stderr(stderr: &str) -> String {
+    let mut lines = stderr.lines().peekable();
+    while matches!(lines.peek(), Some(l) if l.trim().is_empty()) {
+        lines.next();
+    }
+    if !matches!(lines.peek(), Some(l) if l.starts_with("Loading recipe:")) {
+        return stderr.trim().to_string();
+    }
+    lines.next();
+    while let Some(line) = lines.peek() {
+        if is_recipe_banner_continuation(line) {
+            lines.next();
+            continue;
+        }
+        break;
+    }
+    lines.collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+fn is_recipe_banner_continuation(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty()
+        || t.starts_with("Description:")
+        || t.starts_with("Parameters used to load")
+        || is_recipe_param_line(t)
+}
+
+/// Goose lists recipe params as `snake_case: value` (optional indent).
+fn is_recipe_param_line(t: &str) -> bool {
+    let Some((key, _)) = t.split_once(':') else {
+        return false;
+    };
+    let key = key.trim();
+    !key.is_empty()
+        && key.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Token/cost usage for one goose recipe run, parsed from the response
@@ -349,7 +455,12 @@ pub fn run_recipe(
 ) -> Result<RecipeOutcome> {
     // Phase-aware pin: `[model.<phase>]` overrides the `[model]` base for
     // this recipe (e.g. a thorough reviewer + a fast fixer).
-    let pin = model_pin_for(repo, &phase_from_recipe(recipe))?;
+    let pin = model_pin_for(
+        repo,
+        phase_from_recipe(recipe)
+            .map(RecipePhase::as_str)
+            .unwrap_or(""),
+    )?;
     let mut last_usage = Usage::default();
     for attempt in 1..=2u8 {
         match run_recipe_once(repo, recipe, params, max_turns, &pin, attempt)? {
@@ -434,7 +545,10 @@ fn run_recipe_once(
     // Review/fix answers are terse JSON — medium is plenty. An explicitly
     // exported GOOSE_THINKING_EFFORT always wins.
     if std::env::var_os("GOOSE_THINKING_EFFORT").is_none() {
-        cmd.env("GOOSE_THINKING_EFFORT", "medium");
+        let effort = phase_from_recipe(recipe)
+            .map(RecipePhase::thinking_effort)
+            .unwrap_or(ThinkingEffort::Medium);
+        cmd.env("GOOSE_THINKING_EFFORT", effort.as_str());
     }
     // Per-response output budget. The provider's default cap (observed
     // ~4k tokens for glm-5.3) can be consumed by a single long thinking
@@ -461,13 +575,12 @@ fn run_recipe_once(
         cmd.process_group(0);
     }
 
-    // `--max-turns` bounds agent turns, not wall-clock time: a hung goose
-    // (stuck provider call, wedged MCP server) would block the driver
-    // forever. Drain pipes on threads (a full pipe would otherwise block
-    // the child forever — deadlock), poll `try_wait` against a deadline,
-    // and kill the whole group on expiry. Joins are bounded too: a
-    // grandchild that inherits the write-ends can outlive the direct
-    // child even on a NORMAL exit.
+    // `--max-turns` bounds agent turns, not wall-clock time. There is no
+    // default duration cap: a long think/fix is allowed. Optional
+    // `GAGGLE_GOOSE_TIMEOUT_SECS` is a CI budget only. Drain pipes on
+    // threads (a full pipe would otherwise deadlock the child). Joins are
+    // bounded after exit: a grandchild that inherits the write-ends can
+    // outlive the direct child even on a NORMAL exit.
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn goose for recipe {}", recipe.display()))?;
@@ -494,13 +607,13 @@ fn run_recipe_once(
         rx.recv_timeout(limit).unwrap_or_default()
     };
 
-    let timeout = goose_run_timeout();
-    let deadline = std::time::Instant::now() + timeout;
+    let limit = goose_run_timeout();
+    let deadline = limit.map(|t| std::time::Instant::now() + t);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     kill_process_group(&mut child);
                     let _ = child.wait(); // reap so OUR pipe ends close
                     let _ = join_bounded(t_out, std::time::Duration::from_secs(5));
@@ -508,7 +621,7 @@ fn run_recipe_once(
                     bail!(
                         "goose recipe {} timed out after {}s (killed)",
                         recipe.display(),
-                        timeout.as_secs()
+                        limit.unwrap_or_default().as_secs()
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -525,9 +638,6 @@ fn run_recipe_once(
 
     let stdout = join_bounded(t_out, std::time::Duration::from_secs(10));
     let stderr = join_bounded(t_err, std::time::Duration::from_secs(10));
-    if !stderr.is_empty() {
-        eprintln!("[goose stderr] {}", stderr.trim_end());
-    }
 
     // A non-zero exit is a failure regardless of whether we managed to
     // parse a (possibly stale/earlier) assistant JSON message from stdout.
@@ -541,6 +651,15 @@ fn run_recipe_once(
             stdout.chars().take(2000).collect::<String>(),
             stderr.chars().take(2000).collect::<String>(),
         );
+    }
+
+    // Goose writes a recipe-load banner to stderr on every successful
+    // run. Echoing the whole pipe as `[goose stderr]` made that banner
+    // look like a failure. Drop it; leftover lines (real warnings) keep
+    // a neutral `[goose]` label.
+    let leftover = leftover_goose_stderr(&stderr);
+    if !leftover.is_empty() {
+        eprintln!("[goose] {leftover}");
     }
 
     // Clean exit: parse the envelope ONCE — the final JSON comes from its
@@ -668,33 +787,57 @@ fn extract_from_envelope(obj: &Value) -> Option<Value> {
     None
 }
 
-/// Scan `text` from the end for the last JSON value it contains. Tries
-/// (a) individual lines (reverse) for the last JSON line — this respects the
-/// documented "last line of the last assistant block" contract, and avoids
-/// returning a valid-but-intermediate whole-block JSON prematurely; then
-/// (b) parsing the whole trimmed text as a single JSON value — so
-/// multi-line/pretty-printed JSON answers are also recognised.
+/// Scan `text` from the end for the last JSON value it contains.
+///
+/// Pretty-printed `{"components":[ {...}, {...} ]}` has inner `{...}` lines
+/// that are valid JSON. A reverse line scan would return the last array
+/// element (one component) and drop the rest — that is the truncated
+/// discovery we saw on oxllm. Prefer a `components` envelope when present.
 fn scan_trailing_json(text: &str) -> Option<Value> {
-    // (a) Single-line scan (reverse) for the last JSON line. This is tried
-    //     FIRST so that when a block contains multiple JSON lines (e.g. an
-    //     intermediate {"intermediate":true} followed by the real answer)
-    //     we return the LAST one rather than the whole block.
+    if let Some(v) = last_components_object(text) {
+        return Some(v);
+    }
     for line in text.lines().rev() {
         let line = line.trim();
         if line.starts_with('{') && line.ends_with('}') {
             if let Ok(v) = serde_json::from_str::<Value>(line) {
+                // Inner array elements look like a full answer; skip them
+                // so we can fall through to whole-block parse.
+                if v.get("slug").is_some() && v.get("components").is_none() {
+                    continue;
+                }
                 return Some(v);
             }
         }
     }
-    // (b) Whole trimmed text. This correctly handles nested objects (e.g.
-    //     {"a":{"b":1}}) and pretty-printed multi-line JSON, which the old
-    //     rfind('{')-to-rfind('}') approach got wrong by slicing only the
-    //     innermost object. Only reached if no individual line parsed.
     if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
         return Some(v);
     }
     None
+}
+
+/// Last `{"components": [...]}` object in `text`, using brace matching so
+/// pretty-printed / fenced payloads still parse.
+fn last_components_object(text: &str) -> Option<Value> {
+    let mut last = None;
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("\"components\"") {
+        let key = from + rel;
+        let Some(brace) = text[..key].rfind('{') else {
+            from = key + 1;
+            continue;
+        };
+        if let Some(end) = match_brace(&text[brace..]) {
+            let slice = &text[brace..=brace + end];
+            if let Ok(v) = serde_json::from_str::<Value>(slice) {
+                if v.get("components").and_then(|c| c.as_array()).is_some() {
+                    last = Some(v);
+                }
+            }
+        }
+        from = key + 1;
+    }
+    last
 }
 
 /// Convenience: read a string field from the result JSON.
@@ -888,6 +1031,27 @@ mod usage_tests {
     }
 
     #[test]
+    fn pretty_printed_components_array_is_not_truncated_to_last_item() {
+        let text = r#"I listed the packages.
+
+```json
+{"components": [
+  {"slug": "core", "name": "Core", "paths": ["packages/core"], "tier": "high", "priority": 100},
+  {"slug": "api", "name": "API", "paths": ["packages/api"], "tier": "high", "priority": 95}
+]}
+```
+"#;
+        let v = scan_trailing_json(text).expect("json");
+        let slugs: Vec<_> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["slug"].as_str())
+            .collect();
+        assert_eq!(slugs, vec!["core", "api"]);
+    }
+
+    #[test]
     fn last_envelope_wins_over_earlier_one() {
         let two =
             format!("{{\"messages\":[],\"metadata\":{{\"total_tokens\":1}}}}\nbanner\n{ENVELOPE}");
@@ -958,11 +1122,15 @@ mod phase_model_tests {
     #[test]
     fn phase_from_recipe_maps_known_stems_only() {
         let p = std::path::Path::new("/tmp/x/review.yaml");
-        assert_eq!(phase_from_recipe(p), "review");
+        assert_eq!(phase_from_recipe(p), Some(RecipePhase::Review));
         let p = std::path::Path::new("/tmp/x/fix.yaml");
-        assert_eq!(phase_from_recipe(p), "fix");
+        assert_eq!(phase_from_recipe(p), Some(RecipePhase::Fix));
+        let p = std::path::Path::new("/tmp/x/discover-validate.yaml");
+        assert_eq!(phase_from_recipe(p), Some(RecipePhase::Discover));
         let p = std::path::Path::new("/tmp/x/custom-thing.yaml");
-        assert_eq!(phase_from_recipe(p), "");
+        assert_eq!(phase_from_recipe(p), None);
+        assert_eq!(RecipePhase::Discover.thinking_effort(), ThinkingEffort::Low);
+        assert_eq!(RecipePhase::Fix.thinking_effort(), ThinkingEffort::Medium);
     }
 
     #[test]
@@ -974,5 +1142,60 @@ mod phase_model_tests {
         assert!(s.contains("custom_z.ai / glm-5.3"), "{s}");
         assert!(s.contains("fix: custom_z.ai / deepseek-v4-flash"), "{s}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod leftover_stderr_tests {
+    use super::*;
+
+    #[test]
+    fn recipe_load_banner_alone_is_dropped() {
+        let banner = "Loading recipe: Final report open questions\n\
+Description: Distills unresolved findings into decisions for the user\n\
+Parameters used to load this recipe:\n";
+        assert_eq!(leftover_goose_stderr(banner), "");
+    }
+
+    #[test]
+    fn recipe_load_banner_with_params_is_dropped() {
+        let banner = "\
+Loading recipe: Discover components in eldr
+Description: Invent a component checklist for the repo, returned as JSON
+Parameters used to load this recipe:
+  project: eldr
+  existing_checklist: /tmp/x
+";
+        assert_eq!(leftover_goose_stderr(banner), "");
+    }
+
+    #[test]
+    fn unindented_params_are_still_banner() {
+        let banner = "\
+Loading recipe: Discover components in eldr
+Description: Invent a component checklist
+Parameters used to load this recipe:
+project: eldr
+existing_checklist: /tmp/x
+";
+        assert_eq!(leftover_goose_stderr(banner), "");
+    }
+
+    #[test]
+    fn warning_after_banner_is_kept() {
+        let text = "Loading recipe: Fix findings in cli\n\
+Description: Fixes review findings in one repo component\n\
+Parameters used to load this recipe:\n\
+\n\
+WARN rustls: unused\n";
+        assert_eq!(leftover_goose_stderr(text), "WARN rustls: unused");
+    }
+
+    #[test]
+    fn stderr_without_banner_is_kept() {
+        assert_eq!(
+            leftover_goose_stderr("fatal: model not found\n"),
+            "fatal: model not found"
+        );
     }
 }

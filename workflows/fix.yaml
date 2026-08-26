@@ -34,9 +34,16 @@ instructions: |
   - But fix for COMPLETENESS: if a change requires updating call sites,
     registrations, docs, or tests in other files to keep the whole codebase
     correct, make those updates too — a fix that only compiles inside the
-    component is not done.
+    component is not done. Open the docs that describe this component and
+    keep them accurate when behavior changes.
   - Keep tests in sync: update or extend specs that cover the behavior
     you changed (they often live next to the component's files).
+  - VERIFY / FULL-SUITE failures ARE the work. If a finding is a failed
+    harness check (compile, test, lint, missing column, stale fixture),
+    make that command pass. Do not skip it as pre-existing, out of
+    scope, or "already reviewed". The per-component check can miss tests
+    the full-repo gate still runs; a red full gate is still yours. Fix
+    the product or the test — whichever the diagnostics actually show.
   - Do NOT run the full test suite or build (the harness does that next and
     will bounce the fix back to you if it fails).
   - Do NOT commit. The harness owns git.
