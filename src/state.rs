@@ -309,6 +309,20 @@ impl State {
         }
     }
 
+    /// Operator reset for a new pass over the same checklist. Every
+    /// component returns to `Pending` with findings/detail/commit cleared.
+    /// Paths and verify commands stay. This is not a state-machine
+    /// transition (Done has no legal path back to Pending); it is the
+    /// same kind of bulk rewrite `sync` uses when a checkbox is unchecked.
+    pub fn restart_all(&mut self) {
+        for c in self.components.values_mut() {
+            c.phase = Phase::Pending;
+            c.findings = 0;
+            c.detail = String::new();
+            c.commit = None;
+        }
+    }
+
     pub fn get(&self, slug: &str) -> Option<&ComponentState> {
         self.components.get(slug)
     }
@@ -467,6 +481,30 @@ mod tests {
         assert_eq!(row.phase, Phase::Pending);
         assert_eq!(row.findings, 0);
         assert!(row.detail.is_empty());
+    }
+
+    #[test]
+    fn restart_all_resets_done_and_failed() {
+        let mut s = State::default();
+        s.sync(&[
+            Component::new("a", "A", "high"),
+            Component::new("b", "B", "low"),
+        ]);
+        transition(&mut s, "a", Phase::Reviewing).unwrap();
+        transition(&mut s, "a", Phase::Done).unwrap();
+        s.set_findings("a", 3).unwrap();
+        s.set_detail("a", "fixed").unwrap();
+        s.components.get_mut("a").unwrap().commit = Some("abc".into());
+        transition(&mut s, "b", Phase::Reviewing).unwrap();
+        transition(&mut s, "b", Phase::Failed).unwrap();
+        s.restart_all();
+        for slug in ["a", "b"] {
+            let row = s.get(slug).unwrap();
+            assert_eq!(row.phase, Phase::Pending);
+            assert_eq!(row.findings, 0);
+            assert!(row.detail.is_empty());
+            assert!(row.commit.is_none());
+        }
     }
 }
 

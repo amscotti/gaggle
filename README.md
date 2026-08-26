@@ -123,14 +123,16 @@ facts (components, commits, cost) computed by the harness, open questions
 | `gaggle list` | Component table: phase, findings, outcome per component |
 | `gaggle history` | Past runs (outcome, cost, leftovers); `gaggle history <run-id>` replays a run's full report |
 | `gaggle requeue <slug>… \| --all` | Move quarantined components back to pending for retry (unchecking them in the checklist also requeues Done and Failed on the next run) |
+| `gaggle restart` | Same checklist and config, every component pending — for another full pass |
 | `gaggle model` | Print the effective agent model and where it comes from |
 
 All run state lives under `.review/` in the target repo. `gaggle init`
 appends a gitignore rule for that whole directory (config, checklist,
 findings, logs, archives). Every finished run is archived under
 `.review/runs/<timestamp>/` (report, ledger, state snapshot, cost) for
-post-mortems: `gaggle history` summarizes them at a glance. Delete the
-directory and you're back to a clean slate.
+post-mortems: `gaggle history` summarizes them at a glance. `gaggle restart`
+unchecks the checklist and clears this run's findings so `gaggle run` does
+the whole pass again. Delete `.review/` if you want a fresh discovery.
 
 ## Configuration
 

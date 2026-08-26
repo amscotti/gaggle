@@ -2015,6 +2015,60 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
     Ok(requeued)
 }
 
+/// Reset every component to pending for a new pass over the same
+/// checklist. Keeps `config.toml`, recipe overrides, and `.review/runs/`
+/// archives. Clears current findings and the last report so the next
+/// `gaggle run` is a full review, not a no-op on checked boxes.
+pub fn restart(repo: &Path) -> Result<usize> {
+    let review_dir = repo.join(crate::REVIEW_DIR);
+    let state_path = review_dir.join("state.json");
+    let checklist_path = review_dir.join("checklist.md");
+    if !state_path.exists() || !checklist_path.exists() {
+        bail!("no review to restart — run `gaggle init` first");
+    }
+    let mut state = State::load(&state_path)?;
+    if state.components.is_empty() {
+        bail!("state has no components — run `gaggle init` first");
+    }
+    let n = state.components.len();
+    state.restart_all();
+    state.save(&state_path)?;
+    persist_checklist(&review_dir, &state)?;
+    clear_current_run_artifacts(&review_dir)?;
+    status::report(
+        &review_dir,
+        StatusPhase::Idle,
+        "-",
+        &format!("restarted {n} component(s) to pending"),
+    )?;
+    Ok(n)
+}
+
+/// Drop this run's findings/report files. History under `runs/` stays.
+fn clear_current_run_artifacts(review_dir: &Path) -> Result<()> {
+    for name in [
+        "final-report.md",
+        "run-ledger.md",
+        "verify-diagnostics.txt",
+        "gate-components.txt",
+    ] {
+        let p = review_dir.join(name);
+        if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    let findings = review_dir.join("findings");
+    if findings.is_dir() {
+        for entry in std::fs::read_dir(&findings)? {
+            let path = entry?.path();
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2083,6 +2137,64 @@ mod tests {
         assert_eq!(g.cause, "fix");
         assert_eq!(g.component, "db");
         assert_eq!(g.diagnostics, "boom");
+    }
+
+    #[test]
+    fn restart_unchecks_checklist_and_clears_findings() {
+        let dir = std::env::temp_dir().join(format!(
+            "gaggle-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let review = dir.join(".review");
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        let mut comps = vec![Component::new("core", "Core", "high")];
+        comps[0].done = true;
+        comps[0].paths = vec!["src/lib.rs".into()];
+        checklist::save(&review.join("checklist.md"), &comps).unwrap();
+        let mut state = State::default();
+        state.sync(&comps);
+        state.save(&review.join("state.json")).unwrap();
+        std::fs::write(review.join("findings").join("core.txt"), "old").unwrap();
+        std::fs::write(review.join("final-report.md"), "old").unwrap();
+        std::fs::create_dir_all(review.join("runs").join("keep-me")).unwrap();
+        std::fs::write(
+            review.join("runs").join("keep-me").join("final-report.md"),
+            "arch",
+        )
+        .unwrap();
+
+        let n = restart(&dir).unwrap();
+        assert_eq!(n, 1);
+        let state = State::load(&review.join("state.json")).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Pending);
+        let comps = checklist::load(&review.join("checklist.md")).unwrap();
+        assert!(!comps[0].done);
+        assert_eq!(comps[0].paths, vec!["src/lib.rs"]);
+        assert!(!review.join("findings").join("core.txt").exists());
+        assert!(!review.join("final-report.md").exists());
+        assert!(
+            review
+                .join("runs")
+                .join("keep-me")
+                .join("final-report.md")
+                .exists(),
+            "history archives must survive restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_without_init_errors() {
+        let dir = std::env::temp_dir().join(format!("gaggle-restart-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = restart(&dir).unwrap_err().to_string();
+        assert!(err.contains("gaggle init"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
