@@ -387,8 +387,8 @@ impl Engine {
         let leftovers: usize = state
             .components
             .values()
-            .filter(|c| c.phase == Phase::Done && c.findings > 0)
-            .map(|c| c.findings)
+            .filter(|c| c.phase == Phase::Done && c.open > 0)
+            .map(|c| c.open)
             .sum();
         let usage_json = {
             let u = self.usage_total.borrow();
@@ -689,7 +689,7 @@ impl Engine {
         let clean: Vec<&&crate::state::ComponentState> =
             done.iter().filter(|c| c.findings == 0).collect();
         let leftover: Vec<&&crate::state::ComponentState> =
-            done.iter().filter(|c| c.findings > 0).collect();
+            done.iter().filter(|c| c.open > 0).collect();
 
         let mut out = String::from("# Final Review Report\n\n## Run summary\n\n");
         out.push_str(&format!(
@@ -729,12 +729,12 @@ impl Engine {
         // component can still carry unresolved findings).
         let mut needs: Vec<String> = failed
             .iter()
-            .map(|c| format!("{} (failed, {} open)", c.slug, c.findings))
+            .map(|c| format!("{} (failed, {} open)", c.slug, c.open))
             .collect();
         needs.extend(
             leftover
                 .iter()
-                .map(|c| format!("{} (done, {} leftover)", c.slug, c.findings)),
+                .map(|c| format!("{} (done, {} leftover)", c.slug, c.open)),
         );
         out.push_str(&format!(
             "- needs-decision: {}{}\n",
@@ -902,6 +902,7 @@ impl Engine {
         };
         println!("  review: {} finding(s)", findings.len());
         state.set_findings(&slug, findings.len())?;
+        state.set_open(&slug, findings.len())?;
 
         if findings.is_empty() {
             // Remove any stale findings file from an earlier pass —
@@ -1019,7 +1020,7 @@ impl Engine {
                     }
                 };
                 println!("  confirm: {} still open", still.len());
-                state.set_findings(&slug, still.len())?;
+                state.set_open(&slug, still.len())?;
                 findings = still;
                 if !findings.is_empty() {
                     state.set_detail(
@@ -1048,7 +1049,7 @@ impl Engine {
             )];
             next.extend(work_order);
             findings = next;
-            state.set_findings(&slug, findings.len())?;
+            state.set_open(&slug, findings.len())?;
             state.set_detail(
                 &slug,
                 &format!(
@@ -1084,7 +1085,7 @@ impl Engine {
         last_hash: &str,
     ) -> Result<()> {
         self.write_findings_file(slug, leftover)?;
-        state.set_findings(slug, leftover.len())?;
+        state.set_open(slug, leftover.len())?;
         let detail = if leftover.is_empty() {
             if last_hash.is_empty() {
                 "fixed + verified".to_string()
@@ -1831,7 +1832,7 @@ pub fn list(repo: &Path) -> Result<()> {
     let components = checklist::load(&repo.join(".review/checklist.md"))?;
     let state = State::load(&repo.join(".review/state.json"))?;
     println!(
-        "{:<28} {:<10} {:<10} {:<8} detail",
+        "{:<28} {:<10} {:<10} {:<14} detail",
         "slug", "tier", "phase", "findings"
     );
     for c in &components {
@@ -1839,9 +1840,13 @@ pub fn list(repo: &Path) -> Result<()> {
         let phase = st.map(|s| s.phase.as_str()).unwrap_or("pending");
         let findings = st.map(|s| s.findings).unwrap_or(0);
         let detail = st.map(|s| s.detail.as_str()).unwrap_or("");
+        let findings_cell = match st.map(|s| s.open).unwrap_or(0) {
+            0 => findings.to_string(),
+            open => format!("{findings} ({open} open)"),
+        };
         println!(
-            "{:<28} {:<10} {:<10} {:<8} {}",
-            c.slug, c.tier, phase, findings, detail
+            "{:<28} {:<10} {:<10} {:<14} {}",
+            c.slug, c.tier, phase, findings_cell, detail
         );
     }
     Ok(())
@@ -1995,7 +2000,7 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
             .map(|c| c.detail.clone())
             .unwrap_or_default();
         state.set_detail(slug, &format!("requeued (previously: {})", prior.trim()))?;
-        state.set_findings(slug, 0)?;
+        state.set_open(slug, 0)?;
         requeued.push(slug.clone());
         println!("  requeued {slug}");
     }

@@ -56,8 +56,13 @@ pub struct ComponentState {
     pub name: String,
     pub tier: String,
     pub phase: Phase,
-    /// Finding count from the last review (0 = clean).
+    /// How many findings the reviewer reported. Kept after they close so
+    /// `gaggle list` still shows the work that was done (0 = clean review).
     pub findings: usize,
+    /// How many of those are still unresolved (confirm leftovers, or the
+    /// work order when quarantined). 0 on a fully closed component.
+    #[serde(default)]
+    pub open: usize,
     /// Last known detail (e.g. fix outcome or verify failure).
     pub detail: String,
     /// Repo-relative paths this component covers (from AI discovery).
@@ -282,6 +287,7 @@ impl State {
                         // components that most needed another pass.
                         existing.phase = Phase::Pending;
                         existing.findings = 0;
+                        existing.open = 0;
                         existing.detail = String::new();
                     }
                 }
@@ -294,6 +300,7 @@ impl State {
                             tier: c.tier.clone(),
                             phase: if c.done { Phase::Done } else { Phase::Pending },
                             findings: 0,
+                            open: 0,
                             detail: if c.done {
                                 "marked done in checklist".to_string()
                             } else {
@@ -318,6 +325,7 @@ impl State {
         for c in self.components.values_mut() {
             c.phase = Phase::Pending;
             c.findings = 0;
+            c.open = 0;
             c.detail = String::new();
             c.commit = None;
         }
@@ -351,6 +359,15 @@ impl State {
             .get_mut(slug)
             .ok_or_else(|| anyhow::anyhow!("unknown component {slug}"))?;
         c.findings = n;
+        Ok(())
+    }
+
+    pub fn set_open(&mut self, slug: &str, n: usize) -> Result<()> {
+        let c = self
+            .components
+            .get_mut(slug)
+            .ok_or_else(|| anyhow::anyhow!("unknown component {slug}"))?;
+        c.open = n;
         Ok(())
     }
 
@@ -502,6 +519,7 @@ mod tests {
             let row = s.get(slug).unwrap();
             assert_eq!(row.phase, Phase::Pending);
             assert_eq!(row.findings, 0);
+            assert_eq!(row.open, 0);
             assert!(row.detail.is_empty());
             assert!(row.commit.is_none());
         }
