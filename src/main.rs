@@ -1,4 +1,4 @@
-//! gaggle CLI: init | run | status | list | history | requeue
+//! gaggle CLI: init | run | status | list | history | requeue | restart
 //!
 //!   gaggle init [--components "slug|Name|tier,slug2|Name2|tier2"]
 //!   gaggle run [--review-only]
@@ -6,6 +6,7 @@
 //!   gaggle list
 //!   gaggle history [run-id]
 //!   gaggle requeue <slug>… | --all
+//!   gaggle restart
 
 use anyhow::{Result, bail};
 use gaggle::{goose, loop_engine};
@@ -110,6 +111,7 @@ fn main() -> Result<()> {
             }
         }
         "requeue" => cmd_requeue(&repo, &args[2..]),
+        "restart" => cmd_restart(&repo, &args[2..]),
         "model" => {
             println!("{}", goose::effective_model(&repo));
             Ok(())
@@ -151,6 +153,18 @@ fn cmd_requeue(repo: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `gaggle restart` — same checklist and config, every component pending.
+fn cmd_restart(repo: &Path, args: &[String]) -> Result<()> {
+    if let Some(flag) = args.first() {
+        bail!("unrecognized restart argument: {flag} — usage: gaggle restart");
+    }
+    let n = loop_engine::restart(repo)?;
+    println!("restarted {n} component(s) — same checklist, all pending");
+    println!("  (config, recipes, and history archives kept)");
+    println!("run `gaggle run` to start the loop");
+    Ok(())
+}
+
 /// Block operations that would silently reset recorded component
 /// progress (init, auto-discovery in `run`). A CORRUPT state.json is an
 /// error here — treating it as "no progress" (the old `.ok()` swallow)
@@ -183,9 +197,9 @@ fn ensure_no_recorded_progress(repo: &Path) -> Result<()> {
         .unwrap_or(false);
     if has_progress {
         bail!(
-            ".review/state.json records components with progress (done/failed/active) — \
-             this operation would reset it. Move or delete .review/state.json first if \
-             you really want a fresh checklist."
+            ".review/state.json records components with progress (done/failed/active). \
+             Run `gaggle restart` to redo this checklist, or delete .review/state.json \
+             first if you really want a fresh discovery."
         );
     }
     Ok(())
@@ -306,6 +320,7 @@ USAGE:
   gaggle list
   gaggle history [run-id]
   gaggle requeue <slug>… | --all
+  gaggle restart
   gaggle model
 
 COMMANDS:
@@ -317,6 +332,7 @@ COMMANDS:
   list     component phase table
   history  past runs (outcome, cost, leftovers) — detail: gaggle history <run-id>
   requeue  move quarantined (failed) components back to pending for retry
+  restart  reset every component to pending (keeps config and the checklist)
   model    print the effective agent model + where it comes from
 
 MODEL: optional `provider` / `model` keys in .review/config.toml; when unset,

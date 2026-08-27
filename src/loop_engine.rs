@@ -387,8 +387,8 @@ impl Engine {
         let leftovers: usize = state
             .components
             .values()
-            .filter(|c| c.phase == Phase::Done && c.findings > 0)
-            .map(|c| c.findings)
+            .filter(|c| c.phase == Phase::Done && c.open > 0)
+            .map(|c| c.open)
             .sum();
         let usage_json = {
             let u = self.usage_total.borrow();
@@ -689,7 +689,7 @@ impl Engine {
         let clean: Vec<&&crate::state::ComponentState> =
             done.iter().filter(|c| c.findings == 0).collect();
         let leftover: Vec<&&crate::state::ComponentState> =
-            done.iter().filter(|c| c.findings > 0).collect();
+            done.iter().filter(|c| c.open > 0).collect();
 
         let mut out = String::from("# Final Review Report\n\n## Run summary\n\n");
         out.push_str(&format!(
@@ -729,12 +729,12 @@ impl Engine {
         // component can still carry unresolved findings).
         let mut needs: Vec<String> = failed
             .iter()
-            .map(|c| format!("{} (failed, {} open)", c.slug, c.findings))
+            .map(|c| format!("{} (failed, {} open)", c.slug, c.open))
             .collect();
         needs.extend(
             leftover
                 .iter()
-                .map(|c| format!("{} (done, {} leftover)", c.slug, c.findings)),
+                .map(|c| format!("{} (done, {} leftover)", c.slug, c.open)),
         );
         out.push_str(&format!(
             "- needs-decision: {}{}\n",
@@ -902,6 +902,7 @@ impl Engine {
         };
         println!("  review: {} finding(s)", findings.len());
         state.set_findings(&slug, findings.len())?;
+        state.set_open(&slug, findings.len())?;
 
         if findings.is_empty() {
             // Remove any stale findings file from an earlier pass —
@@ -1019,7 +1020,7 @@ impl Engine {
                     }
                 };
                 println!("  confirm: {} still open", still.len());
-                state.set_findings(&slug, still.len())?;
+                state.set_open(&slug, still.len())?;
                 findings = still;
                 if !findings.is_empty() {
                     state.set_detail(
@@ -1048,7 +1049,7 @@ impl Engine {
             )];
             next.extend(work_order);
             findings = next;
-            state.set_findings(&slug, findings.len())?;
+            state.set_open(&slug, findings.len())?;
             state.set_detail(
                 &slug,
                 &format!(
@@ -1084,7 +1085,7 @@ impl Engine {
         last_hash: &str,
     ) -> Result<()> {
         self.write_findings_file(slug, leftover)?;
-        state.set_findings(slug, leftover.len())?;
+        state.set_open(slug, leftover.len())?;
         let detail = if leftover.is_empty() {
             if last_hash.is_empty() {
                 "fixed + verified".to_string()
@@ -1831,7 +1832,7 @@ pub fn list(repo: &Path) -> Result<()> {
     let components = checklist::load(&repo.join(".review/checklist.md"))?;
     let state = State::load(&repo.join(".review/state.json"))?;
     println!(
-        "{:<28} {:<10} {:<10} {:<8} detail",
+        "{:<28} {:<10} {:<10} {:<14} detail",
         "slug", "tier", "phase", "findings"
     );
     for c in &components {
@@ -1839,9 +1840,13 @@ pub fn list(repo: &Path) -> Result<()> {
         let phase = st.map(|s| s.phase.as_str()).unwrap_or("pending");
         let findings = st.map(|s| s.findings).unwrap_or(0);
         let detail = st.map(|s| s.detail.as_str()).unwrap_or("");
+        let findings_cell = match st.map(|s| s.open).unwrap_or(0) {
+            0 => findings.to_string(),
+            open => format!("{findings} ({open} open)"),
+        };
         println!(
-            "{:<28} {:<10} {:<10} {:<8} {}",
-            c.slug, c.tier, phase, findings, detail
+            "{:<28} {:<10} {:<10} {:<14} {}",
+            c.slug, c.tier, phase, findings_cell, detail
         );
     }
     Ok(())
@@ -1995,7 +2000,7 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
             .map(|c| c.detail.clone())
             .unwrap_or_default();
         state.set_detail(slug, &format!("requeued (previously: {})", prior.trim()))?;
-        state.set_findings(slug, 0)?;
+        state.set_open(slug, 0)?;
         requeued.push(slug.clone());
         println!("  requeued {slug}");
     }
@@ -2013,6 +2018,60 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
         ),
     )?;
     Ok(requeued)
+}
+
+/// Reset every component to pending for a new pass over the same
+/// checklist. Keeps `config.toml`, recipe overrides, and `.review/runs/`
+/// archives. Clears current findings and the last report so the next
+/// `gaggle run` is a full review, not a no-op on checked boxes.
+pub fn restart(repo: &Path) -> Result<usize> {
+    let review_dir = repo.join(crate::REVIEW_DIR);
+    let state_path = review_dir.join("state.json");
+    let checklist_path = review_dir.join("checklist.md");
+    if !state_path.exists() || !checklist_path.exists() {
+        bail!("no review to restart — run `gaggle init` first");
+    }
+    let mut state = State::load(&state_path)?;
+    if state.components.is_empty() {
+        bail!("state has no components — run `gaggle init` first");
+    }
+    let n = state.components.len();
+    state.restart_all();
+    state.save(&state_path)?;
+    persist_checklist(&review_dir, &state)?;
+    clear_current_run_artifacts(&review_dir)?;
+    status::report(
+        &review_dir,
+        StatusPhase::Idle,
+        "-",
+        &format!("restarted {n} component(s) to pending"),
+    )?;
+    Ok(n)
+}
+
+/// Drop this run's findings/report files. History under `runs/` stays.
+fn clear_current_run_artifacts(review_dir: &Path) -> Result<()> {
+    for name in [
+        "final-report.md",
+        "run-ledger.md",
+        "verify-diagnostics.txt",
+        "gate-components.txt",
+    ] {
+        let p = review_dir.join(name);
+        if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    let findings = review_dir.join("findings");
+    if findings.is_dir() {
+        for entry in std::fs::read_dir(&findings)? {
+            let path = entry?.path();
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2083,6 +2142,64 @@ mod tests {
         assert_eq!(g.cause, "fix");
         assert_eq!(g.component, "db");
         assert_eq!(g.diagnostics, "boom");
+    }
+
+    #[test]
+    fn restart_unchecks_checklist_and_clears_findings() {
+        let dir = std::env::temp_dir().join(format!(
+            "gaggle-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let review = dir.join(".review");
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        let mut comps = vec![Component::new("core", "Core", "high")];
+        comps[0].done = true;
+        comps[0].paths = vec!["src/lib.rs".into()];
+        checklist::save(&review.join("checklist.md"), &comps).unwrap();
+        let mut state = State::default();
+        state.sync(&comps);
+        state.save(&review.join("state.json")).unwrap();
+        std::fs::write(review.join("findings").join("core.txt"), "old").unwrap();
+        std::fs::write(review.join("final-report.md"), "old").unwrap();
+        std::fs::create_dir_all(review.join("runs").join("keep-me")).unwrap();
+        std::fs::write(
+            review.join("runs").join("keep-me").join("final-report.md"),
+            "arch",
+        )
+        .unwrap();
+
+        let n = restart(&dir).unwrap();
+        assert_eq!(n, 1);
+        let state = State::load(&review.join("state.json")).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Pending);
+        let comps = checklist::load(&review.join("checklist.md")).unwrap();
+        assert!(!comps[0].done);
+        assert_eq!(comps[0].paths, vec!["src/lib.rs"]);
+        assert!(!review.join("findings").join("core.txt").exists());
+        assert!(!review.join("final-report.md").exists());
+        assert!(
+            review
+                .join("runs")
+                .join("keep-me")
+                .join("final-report.md")
+                .exists(),
+            "history archives must survive restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_without_init_errors() {
+        let dir = std::env::temp_dir().join(format!("gaggle-restart-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = restart(&dir).unwrap_err().to_string();
+        assert!(err.contains("gaggle init"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
