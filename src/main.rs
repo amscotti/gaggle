@@ -1,4 +1,4 @@
-//! gaggle CLI: init | run | status | list | history | requeue | restart
+//! gaggle CLI: init | run | status | list | history | requeue | restart | refresh
 //!
 //!   gaggle init [--components "slug|Name|tier,slug2|Name2|tier2"]
 //!   gaggle run [--review-only]
@@ -7,6 +7,7 @@
 //!   gaggle history [run-id]
 //!   gaggle requeue <slug>… | --all
 //!   gaggle restart
+//!   gaggle refresh
 
 use anyhow::{Result, bail};
 use gaggle::{goose, loop_engine};
@@ -112,6 +113,7 @@ fn main() -> Result<()> {
         }
         "requeue" => cmd_requeue(&repo, &args[2..]),
         "restart" => cmd_restart(&repo, &args[2..]),
+        "refresh" => cmd_refresh(&repo, &args[2..]),
         "model" => {
             println!("{}", goose::effective_model(&repo));
             Ok(())
@@ -163,6 +165,75 @@ fn cmd_restart(repo: &Path, args: &[String]) -> Result<()> {
     println!("  (config, recipes, and history archives kept)");
     println!("run `gaggle run` to start the loop");
     Ok(())
+}
+
+/// `gaggle refresh` — rediscover components, keep progress on live slugs.
+fn cmd_refresh(repo: &Path, args: &[String]) -> Result<()> {
+    if let Some(flag) = args.first() {
+        bail!("unrecognized refresh argument: {flag} — usage: gaggle refresh");
+    }
+    let old_verify = gate_cmds(repo, "verify");
+    let old_final = gate_cmds(repo, "final_verify");
+    let delta = loop_engine::refresh(repo)?;
+    let new_verify = gate_cmds(repo, "verify");
+    let new_final = gate_cmds(repo, "final_verify");
+    println!(
+        "refreshed checklist: {} added, {} dropped, {} kept",
+        delta.added.len(),
+        delta.dropped.len(),
+        delta.kept.len()
+    );
+    if !delta.added.is_empty() {
+        println!("  added:   {}", delta.added.join(", "));
+    }
+    if !delta.dropped.is_empty() {
+        println!("  dropped: {}", delta.dropped.join(", "));
+    }
+    if !delta.kept.is_empty() {
+        println!("  kept:    {}", delta.kept.join(", "));
+    }
+    println!(
+        "  project verify: {} → {}",
+        fmt_cmds(&old_verify),
+        fmt_cmds(&new_verify)
+    );
+    println!(
+        "  final verify:   {} → {}",
+        fmt_cmds(&old_final),
+        fmt_cmds(&new_final)
+    );
+    println!("run `gaggle run` to review new/pending components");
+    println!("  (or `gaggle restart` then `gaggle run` for a full pass)");
+    println!("  quarantined components stay failed until `gaggle requeue`");
+    Ok(())
+}
+
+fn gate_cmds(repo: &Path, key: &str) -> Vec<String> {
+    let path = repo.join(".review/config.toml");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(t) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    t.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn fmt_cmds(cmds: &[String]) -> String {
+    format!(
+        "[{}]",
+        cmds.iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Block operations that would silently reset recorded component
@@ -309,18 +380,18 @@ fn print_init_success(count: usize, label: &str) {
     println!("run `gaggle run` to start the loop");
 }
 
-fn print_help() {
-    println!(
-        r#"gaggle — checklist-driven autonomous review/fix loop on the Goose GDK stack
+const HELP: &str = "\
+gaggle — checklist-driven autonomous review/fix loop on the Goose GDK stack
 
 USAGE:
-  gaggle init [--components "slug|Name|tier,slug2|Name2|tier2"]
+  gaggle init [--components \"slug|Name|tier,slug2|Name2|tier2\"]
   gaggle run [--review-only]
   gaggle status [--tail N]
   gaggle list
   gaggle history [run-id]
   gaggle requeue <slug>… | --all
   gaggle restart
+  gaggle refresh
   gaggle model
 
 COMMANDS:
@@ -333,12 +404,86 @@ COMMANDS:
   history  past runs (outcome, cost, leftovers) — detail: gaggle history <run-id>
   requeue  move quarantined (failed) components back to pending for retry
   restart  reset every component to pending (keeps config and the checklist)
+  refresh  rediscover components against the current tree (keeps progress on live slugs;
+           rewrites verify / final_verify in .review/config.toml)
   model    print the effective agent model + where it comes from
 
 MODEL: optional `provider` / `model` keys in .review/config.toml; when unset,
        goose's configured default is used (GOOSE_PROVIDER/GOOSE_MODEL or its
        config.yaml). Nothing is hard-coded; recipes never pin a model.
 RECIPES: baked in; override any with .review/workflows/<name>.yaml
-"#,
-    );
+";
+
+fn print_help() {
+    print!("{HELP}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "gaggle-main-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn help_lists_refresh_next_to_restart() {
+        assert!(HELP.contains("gaggle refresh"));
+        let restart = HELP.find("gaggle restart").expect("restart usage");
+        let refresh = HELP.find("gaggle refresh").expect("refresh usage");
+        assert!(
+            refresh > restart,
+            "USAGE should list refresh next to restart"
+        );
+        assert!(HELP.contains("rewrites verify / final_verify"));
+    }
+
+    #[test]
+    fn refresh_rejects_unknown_args() {
+        let dir = unique_dir("refresh-args");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = cmd_refresh(&dir, &["--nope".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("usage: gaggle refresh"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_no_recorded_progress_blocks_done() {
+        let dir = unique_dir("progress-guard");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(&review).unwrap();
+        std::fs::write(
+            review.join("state.json"),
+            r#"{"components":{"core":{"slug":"core","name":"Core","tier":"high","phase":"done","findings":1,"detail":"ok"}}}"#,
+        )
+        .unwrap();
+        let err = ensure_no_recorded_progress(&dir).unwrap_err().to_string();
+        assert!(err.contains("gaggle restart"), "{err}");
+        assert!(err.contains("state.json"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_no_recorded_progress_allows_all_pending() {
+        let dir = unique_dir("progress-ok");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(&review).unwrap();
+        std::fs::write(
+            review.join("state.json"),
+            r#"{"components":{"core":{"slug":"core","name":"Core","tier":"high","phase":"pending","findings":0,"detail":""}}}"#,
+        )
+        .unwrap();
+        ensure_no_recorded_progress(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

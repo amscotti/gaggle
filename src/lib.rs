@@ -3,7 +3,7 @@
 //! Architecture (extensible; components are modules so more can be added):
 //!
 //! ```text
-//! main.rs      CLI: init | run | status | list | history | requeue | restart | model
+//! main.rs      CLI: init | run | status | list | history | requeue | restart | refresh | model
 //! checklist.rs component checklist (markdown parse/export, like the Go original)
 //! state.rs     per-component phase state machine + JSON persistence
 //! status.rs    LIVE observability: status.json + activity.log

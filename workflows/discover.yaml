@@ -112,6 +112,10 @@ instructions: |
   For EACH existing component in that file, decide:
   - KEEP (reuse the slug) if the code it covers still exists — you may
     refine its paths/name/description to match the current code.
+    On KEEP, reuse the listed `verify` command(s) unless you found a
+    more accurate slice-specific command this repo already runs (CI /
+    the package's own test). Do not drop a listed verify because the
+    example JSON omitted the field.
   - DROP it entirely if its code has been removed, renamed, merged, or
     deprecated — do not keep dead components on the list.
   - ADD new slugs for any new areas of the codebase not covered above.

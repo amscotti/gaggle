@@ -313,6 +313,51 @@ mod tests {
     }
 
     #[test]
+    fn apply_discovered_gates_leaves_model_commit_and_stall_keys() {
+        let repo = temp_repo();
+        fs::create_dir_all(repo.join(".review")).unwrap();
+        fs::write(
+            repo.join(".review/config.toml"),
+            "verify = [\"false\"]\n\
+             final_verify = [\"false\"]\n\
+             verify_stall_secs = 900\n\
+             [model]\n\
+             provider = \"openai\"\n\
+             model = \"gpt-5.6\"\n\
+             [commit]\n\
+             sign = false\n\
+             [branch]\n\
+             dedicated = true\n",
+        )
+        .unwrap();
+        apply_discovered_gates(
+            &repo,
+            &["./scripts/check.sh".to_string()],
+            &["./scripts/e2e.sh".to_string()],
+        )
+        .unwrap();
+        let cfg = fs::read_to_string(repo.join(".review/config.toml")).unwrap();
+        assert!(
+            cfg.lines()
+                .any(|l| l == "verify = [\"./scripts/check.sh\"]"),
+            "{cfg}"
+        );
+        assert!(
+            cfg.lines()
+                .any(|l| l == "final_verify = [\"./scripts/e2e.sh\"]"),
+            "{cfg}"
+        );
+        assert!(cfg.contains("verify_stall_secs = 900"), "{cfg}");
+        assert!(cfg.contains("[model]"), "{cfg}");
+        assert!(cfg.contains("provider = \"openai\""), "{cfg}");
+        assert!(cfg.contains("[commit]"), "{cfg}");
+        assert!(cfg.contains("sign = false"), "{cfg}");
+        assert!(cfg.contains("[branch]"), "{cfg}");
+        assert!(cfg.contains("dedicated = true"), "{cfg}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn apply_discovered_gates_writes_both_keys() {
         let repo = temp_repo();
         fs::create_dir_all(repo.join(".review")).unwrap();

@@ -6,10 +6,10 @@
 //! # Checklist
 //!
 //! ## high
-//! - [ ] my-slug — Human Name
+//! - [ ] my-slug — pending (or operator-requested redo)
 //!   paths: src/foo.rs, src/foo/
 //!   verify: <the command this repo uses to check this slice>
-//! - [x] done-slug — Already Done
+//! - [x] parked-slug — not pending (Done or Failed; `gaggle list` shows which)
 //!   paths: src/done.rs
 //! ```
 
