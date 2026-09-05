@@ -659,6 +659,207 @@ mod priority_tests {
     }
 
     #[test]
+    fn write_proposal_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "gaggle-discover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let d = Discovery {
+            verify: vec!["cargo test".into()],
+            final_verify: vec!["cargo test --release".into()],
+            components: normalize(vec![
+                serde_json::from_value(serde_json::json!({
+                    "slug": "a", "name": "A", "tier": "high", "paths": ["src/a.rs"]
+                }))
+                .unwrap(),
+            ])
+            .unwrap(),
+        };
+        let p = dir.join("sub").join("proposal.json");
+        write_proposal(&p, &d).unwrap();
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(back["verify"], serde_json::json!(["cargo test"]));
+        assert_eq!(back["components"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_rejects_non_array_components_and_missing_key() {
+        let v = serde_json::json!({"components": {"slug": "a"}});
+        let err = parse_discovery_payload(&v).unwrap_err().to_string();
+        assert!(err.contains("must be an array"), "{err}");
+        let v = serde_json::json!({"verify": ["x"]});
+        let err = parse_discovery_payload(&v).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn parse_accepts_bare_array_and_string_gates() {
+        let v = serde_json::json!([
+            {"slug": "a", "name": "A", "paths": ["src"], "tier": "high"}
+        ]);
+        let p = parse_discovery_payload(&v).unwrap();
+        assert_eq!(p.components.len(), 1);
+        // Singular string gates and nulls degrade gracefully.
+        let v = serde_json::json!({
+            "verify": "cargo test",
+            "final_verify": null,
+            "components": []
+        });
+        let p = parse_discovery_payload(&v).unwrap();
+        assert_eq!(p.verify, vec!["cargo test"]);
+        assert!(p.final_verify.is_empty());
+        // A non-string/non-array gate is ignored, not fatal.
+        let v = serde_json::json!({
+            "verify": {"cmd": "x"},
+            "components": []
+        });
+        let p = parse_discovery_payload(&v).unwrap();
+        assert!(p.verify.is_empty());
+    }
+
+    #[test]
+    fn normalize_rejects_unusable_items_and_enforces_bounds() {
+        // Empty input fails the minimum-components bound.
+        assert!(normalize(vec![]).is_err());
+        // A bad slug with no paths and no name has nothing to derive
+        // from — zero usable items also fails the bound.
+        let bad: Vec<RawItem> = vec![
+            serde_json::from_value(serde_json::json!(
+                {"slug": "!!!", "name": "", "paths": [], "tier": "high"}
+            ))
+            .unwrap(),
+        ];
+        assert!(normalize(bad).is_err());
+        // A valid slug whose paths all escape is rejected the same way.
+        let escaped: Vec<RawItem> = vec![
+            serde_json::from_value(serde_json::json!(
+                {"slug": "ok", "name": "O", "paths": ["../escape"], "tier": "high"}
+            ))
+            .unwrap(),
+        ];
+        assert!(normalize(escaped).is_err());
+        // A garbage slug with usable paths DERIVES a slug from the path
+        // (lenient by design) and survives alongside the good item.
+        let items: Vec<RawItem> = vec![
+            serde_json::from_value(serde_json::json!(
+                {"slug": "!!!", "name": "", "paths": ["src/e.rs"], "tier": "high"}
+            ))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!(
+                {"slug": "good", "name": "", "paths": ["src/g.rs"], "tier": "high"}
+            ))
+            .unwrap(),
+        ];
+        let out = normalize(items).unwrap();
+        assert_eq!(out.len(), 2);
+        // Empty name falls back to the slug.
+        assert!(out.iter().all(|c| c.name == c.slug));
+    }
+
+    #[test]
+    fn normalize_truncates_to_highest_priority() {
+        let items: Vec<RawItem> = (1..=MAX_COMPONENTS + 5)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "slug": format!("c-{i:02}"), "name": "N",
+                    "paths": ["src/x.rs"], "tier": "low", "priority": i
+                }))
+                .unwrap()
+            })
+            .collect();
+        let out = normalize(items).unwrap();
+        assert_eq!(out.len(), MAX_COMPONENTS);
+        // Sorted by priority desc: the five lowest priorities were cut.
+        assert!(out[0].priority >= out[out.len() - 1].priority);
+        assert!(out.iter().all(|c| c.priority >= 6));
+        assert!(!out.iter().any(|c| c.slug == "c-01"));
+    }
+
+    #[test]
+    fn valid_slug_table() {
+        for good in ["a", "loop-engine", "x1", "a-b-c"] {
+            assert!(valid_slug(good), "{good}");
+        }
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "a--b",
+            "UPPER",
+            "with space",
+            "with/slash",
+            "with.dot",
+            "with_underscore",
+        ] {
+            assert!(!valid_slug(bad), "{bad}");
+        }
+        assert!(!valid_slug(&"a".repeat(65)), "over length limit");
+    }
+
+    #[test]
+    fn slug_derives_from_path_then_name() {
+        // Garbage slug falls back to the first path's stem.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "!!!", "name": "N", "paths": ["src/foo_bar.rs"], "tier": "high"}
+        ))
+        .unwrap();
+        let out = normalize(vec![it]).unwrap();
+        assert_eq!(out[0].slug, "foo-bar");
+        // Unusable path stem falls back to the name.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "!!!", "name": "My Comp", "paths": ["src/ok.rs"], "tier": "high"}
+        ))
+        .unwrap();
+        // "src/ok.rs" stem is usable ("ok"), so path wins over the name.
+        let out = normalize(vec![it]).unwrap();
+        assert_eq!(out[0].slug, "ok");
+        // Singular `path` alias is merged with `paths`.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "s", "name": "S", "paths": ["src/a.rs"], "path": "src/b.rs", "tier": "high"}
+        ))
+        .unwrap();
+        assert_eq!(collect_paths(&it), vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn de_paths_leniency() {
+        // Null and non-string shapes degrade to empty.
+        for v in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({"a": 1}),
+        ] {
+            let it: RawItem = serde_json::from_value(serde_json::json!(
+                {"slug": "a", "name": "A", "tier": "high", "paths": v}
+            ))
+            .unwrap();
+            assert!(collect_paths(&it).is_empty(), "{v}");
+        }
+        // Non-string array entries are dropped, strings kept.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "a", "name": "A", "tier": "high", "paths": ["src/a.rs", 7]}
+        ))
+        .unwrap();
+        assert_eq!(collect_paths(&it), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn collect_verify_trims_dedupes_and_drops_control() {
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "a", "name": "A", "tier": "high", "paths": ["src"],
+             "verify": [" cargo test ", "", "cargo test", "bad\u{1}cmd"]}
+        ))
+        .unwrap();
+        assert_eq!(collect_verify(&it), vec!["cargo test"]);
+    }
+
+    #[test]
     fn paths_dedupe_after_segment_collapse() {
         let item = serde_json::json!({
             "slug": "a", "name": "A", "tier": "high",

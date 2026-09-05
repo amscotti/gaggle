@@ -293,4 +293,130 @@ mod tests {
         let out = tail_lines_from_buf(buf, false, 10);
         assert_eq!(out, vec!["line1", "line2", "line3"]);
     }
+
+    fn unique_path(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        std::env::temp_dir().join(format!(
+            "gaggle-status-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn read_last_lines_missing_file_is_none() {
+        let p = unique_path("missing").join("activity.log");
+        assert!(read_last_lines(&p, 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_last_lines_empty_file_is_none() {
+        let dir = unique_path("empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("activity.log");
+        std::fs::write(&p, "").unwrap();
+        assert!(read_last_lines(&p, 5).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_last_lines_zero_n_is_empty_window_not_none() {
+        let dir = unique_path("zero");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("activity.log");
+        std::fs::write(&p, "a\nb\n").unwrap();
+        assert_eq!(
+            read_last_lines(&p, 0).unwrap().unwrap(),
+            Vec::<String>::new()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase_as_str_covers_all_phases() {
+        assert_eq!(
+            [
+                Phase::Picking,
+                Phase::Reviewing,
+                Phase::Fixing,
+                Phase::Verifying,
+                Phase::Committing,
+                Phase::Done,
+                Phase::Failed,
+                Phase::Idle,
+            ]
+            .map(|p| p.as_str()),
+            [
+                "picking",
+                "reviewing",
+                "fixing",
+                "verifying",
+                "committing",
+                "done",
+                "failed",
+                "idle"
+            ]
+        );
+    }
+
+    #[test]
+    fn status_new_flattens_controls_and_truncates() {
+        let s = Status::new(Phase::Fixing, "comp\nx", "a\nb\tc\x01d");
+        assert_eq!(s.component, "comp x");
+        assert!(!s.detail.contains(['\n', '\t', '\x01']));
+        let long = "y".repeat(500);
+        let s = Status::new(Phase::Done, "c", &long);
+        assert_eq!(s.detail.len(), 300);
+    }
+
+    #[test]
+    fn report_writes_snapshot_and_appends_timeline() {
+        let dir = unique_path("report");
+        std::fs::create_dir_all(&dir).unwrap();
+        report(&dir, Phase::Reviewing, "core", "first").unwrap();
+        report(&dir, Phase::Done, "core", "second").unwrap();
+        // Snapshot holds the latest phase…
+        let snap: Status =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(snap.phase, "done");
+        // …and the timeline holds every transition in order.
+        let log = std::fs::read_to_string(dir.join("activity.log")).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("reviewing") && lines[1].contains("done"),
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_status_on_fresh_dir_is_ok() {
+        let dir = unique_path("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        print_status(&dir, 8).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_last_lines_returns_tail() {
+        let dir = unique_path("tail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("activity.log");
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(
+            read_last_lines(&p, 2).unwrap().unwrap(),
+            vec!["two", "three"]
+        );
+        // Asking for more than present returns everything.
+        assert_eq!(
+            read_last_lines(&p, 10).unwrap().unwrap(),
+            vec!["one", "two", "three"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

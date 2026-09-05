@@ -879,6 +879,126 @@ mod tests {
     }
 
     #[test]
+    fn load_commands_rejects_corrupt_and_mistyped() {
+        let dir = temp_repo();
+        let cfg = dir.join(".review/config.toml");
+        std::fs::write(&cfg, "not toml [[[\n").unwrap();
+        assert!(load_commands(&dir).is_err());
+        // `verify` must be an array of strings.
+        std::fs::write(&cfg, "verify = \"cargo test\"\n").unwrap();
+        let err = load_commands(&dir).unwrap_err().to_string();
+        assert!(err.contains("must be an array"), "{err}");
+        std::fs::write(&cfg, "verify = [\"ok\", 42]\n").unwrap();
+        let err = load_commands(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("verify[1]") && err.contains("must be a string"),
+            "{err}"
+        );
+        // Whitespace-only entries are rejected, not silently skipped.
+        std::fs::write(&cfg, "verify = [\"   \"]\n").unwrap();
+        assert!(load_commands(&dir).is_err());
+        // Missing key is rejected for the required gate…
+        std::fs::write(&cfg, "final_verify = [\"x\"]\n").unwrap();
+        let err = load_commands(&dir).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+        // …but final_verify falls back to verify when unset.
+        std::fs::write(&cfg, "verify = [\"cargo test\"]\n").unwrap();
+        assert_eq!(load_final_commands(&dir).unwrap(), vec!["cargo test"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_nonempty_line_skips_blanks_and_markers() {
+        assert_eq!(last_nonempty_line("a\n\n[gaggle] note\nb\n"), Some("b"));
+        assert_eq!(last_nonempty_line("[gaggle] only\n  \n"), None);
+        assert_eq!(last_nonempty_line(""), None);
+    }
+
+    #[test]
+    fn kill_markers_name_command_and_cause() {
+        assert!(
+            VerifyKill::Stall {
+                idle: std::time::Duration::from_secs(7)
+            }
+            .is_stall()
+        );
+        assert!(
+            !VerifyKill::Timeout {
+                after: std::time::Duration::from_secs(7)
+            }
+            .is_stall()
+        );
+        let mut out = String::new();
+        note_kill(
+            &mut out,
+            "slow.sh",
+            &VerifyKill::Stall {
+                idle: std::time::Duration::from_secs(7),
+            },
+            Some("last words"),
+        );
+        assert!(
+            out.contains("slow.sh") && out.contains("last words"),
+            "{out}"
+        );
+        let mut out = String::new();
+        note_kill(
+            &mut out,
+            "slow.sh",
+            &VerifyKill::Timeout {
+                after: std::time::Duration::from_secs(9),
+            },
+            None,
+        );
+        assert!(out.contains("slow.sh") && out.contains('9'), "{out}");
+    }
+
+    #[test]
+    fn resolve_timeout_env_wins_and_garbage_falls_back() {
+        use std::time::Duration;
+        // Invalid env is ignored so a typo does not skip a repo setting.
+        assert_eq!(
+            resolve_verify_timeout(Some("soon"), Some(5)),
+            Some(Duration::from_secs(5))
+        );
+        // Explicit zero disables even when config sets a timeout.
+        assert_eq!(resolve_verify_timeout(Some("0"), Some(5)), None);
+        assert_eq!(
+            resolve_verify_timeout(Some("30"), Some(5)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(resolve_verify_timeout(None, None), None);
+    }
+
+    #[test]
+    fn resolve_stall_zero_disables_and_invalid_falls_back() {
+        use std::time::Duration;
+        assert_eq!(resolve_verify_stall(Some("0"), Some(60)), None);
+        assert_eq!(
+            resolve_verify_stall(Some("30"), None),
+            Some(Duration::from_secs(30))
+        );
+        // Invalid env falls back to config; absent config → 15m default.
+        assert_eq!(
+            resolve_verify_stall(Some("soon"), Some(60)),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(resolve_verify_stall(None, None), Some(DEFAULT_STALL));
+        assert_eq!(resolve_verify_stall(None, Some(0)), None);
+    }
+
+    #[test]
+    fn append_output_joins_streams_with_newlines() {
+        let mut buf = String::new();
+        append_output(&mut buf, b"out", b"err\n");
+        assert_eq!(buf, "out\nerr\n");
+        // Lossy conversion never fails on hostile bytes.
+        let mut buf = String::new();
+        append_output(&mut buf, &[0xff, 0xfe], b"");
+        assert!(buf.ends_with('\n'));
+    }
+
+    #[test]
     fn run_fails_on_nonzero_exit() {
         let dir = temp_repo();
         #[cfg(windows)]

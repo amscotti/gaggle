@@ -1052,6 +1052,117 @@ mod usage_tests {
     }
 
     #[test]
+    fn extract_skips_non_assistant_and_non_text_blocks() {
+        let env = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "{\"nope\": 1}"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "text": "x"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "chatter, no json"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "done\n{\"outcome\": \"fixed\"}"}]},
+            ]
+        });
+        let v = extract_from_envelope(&env).expect("json");
+        assert_eq!(v.get("outcome").and_then(|o| o.as_str()), Some("fixed"));
+        // Nothing parseable anywhere → None (never invents a result).
+        let env = serde_json::json!({
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "just words"}]}]
+        });
+        assert!(extract_from_envelope(&env).is_none());
+        assert!(extract_from_envelope(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn scan_skips_inner_elements_and_falls_back_to_block() {
+        // A trailing inner array element is skipped, not returned as the
+        // answer; with the enclosing block broken, nothing parses → None.
+        let v =
+            scan_trailing_json("{\"components\": [oops\n{\"slug\": \"a\", \"paths\": [\"src\"]}");
+        assert!(v.is_none());
+        // Whole-block JSON that spans lines still parses.
+        let v = scan_trailing_json("{\n\"outcome\": \"fixed\"\n}").expect("json");
+        assert_eq!(v.get("outcome").and_then(|o| o.as_str()), Some("fixed"));
+        assert!(scan_trailing_json("no json at all").is_none());
+    }
+
+    #[test]
+    fn last_components_object_needs_a_components_array() {
+        assert!(last_components_object("{\"slug\": \"a\"}").is_none());
+        assert!(last_components_object("plain text").is_none());
+        // A `"components"` mention with no opening brace is skipped, and
+        // the later real object still wins.
+        let v = last_components_object(
+            "components was discussed\n{\"components\": [{\"slug\": \"a\"}]}",
+        )
+        .expect("json");
+        assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn field_reads_string_fields_only() {
+        let v = serde_json::json!({"a": "x", "n": 1});
+        assert_eq!(field(&v, "a"), Some("x"));
+        assert_eq!(field(&v, "missing"), None);
+        assert_eq!(field(&v, "n"), None);
+    }
+
+    #[test]
+    fn thinking_effort_pins_by_phase() {
+        use RecipePhase::*;
+        assert_eq!(Discover.thinking_effort(), ThinkingEffort::Low);
+        assert_eq!(Review.thinking_effort(), ThinkingEffort::Medium);
+        assert_eq!(Fix.thinking_effort(), ThinkingEffort::Medium);
+        assert_eq!(ThinkingEffort::High.as_str(), "high");
+    }
+
+    #[test]
+    fn goose_timeout_parses_seconds_and_zero_disables() {
+        let key = "GAGGLE_GOOSE_TIMEOUT_SECS";
+        let saved = std::env::var(key).ok();
+        // SAFETY: no other test in this binary touches this variable
+        // (it is only read by goose_run_timeout), so sequential
+        // mutation within this single test cannot race.
+        unsafe {
+            // Unset → no timeout (long agent runs are legitimate work).
+            std::env::remove_var(key);
+        }
+        assert_eq!(goose_run_timeout(), None);
+        unsafe {
+            std::env::set_var(key, "90");
+        }
+        assert_eq!(
+            goose_run_timeout(),
+            Some(std::time::Duration::from_secs(90))
+        );
+        // Explicit zero and garbage both mean no timeout (garbage warns).
+        unsafe {
+            std::env::set_var(key, "0");
+        }
+        assert_eq!(goose_run_timeout(), None);
+        unsafe {
+            std::env::set_var(key, "soon");
+        }
+        assert_eq!(goose_run_timeout(), None);
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn summary_reports_empty_and_cache_fields() {
+        assert_eq!(Usage::default().summary(), "(usage not reported)");
+        assert!(Usage::default().is_empty());
+        let u = Usage {
+            cache_read_input_tokens: Some(5),
+            ..Default::default()
+        };
+        assert!(!u.is_empty());
+        assert!(u.summary().contains("5 cache-read"), "{}", u.summary());
+    }
+
+    #[test]
     fn last_envelope_wins_over_earlier_one() {
         let two =
             format!("{{\"messages\":[],\"metadata\":{{\"total_tokens\":1}}}}\nbanner\n{ENVELOPE}");

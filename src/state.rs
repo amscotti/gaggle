@@ -527,6 +527,188 @@ mod tests {
 }
 
 #[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "gaggle-state-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn sample_state() -> State {
+        let mut s = State::default();
+        s.sync(&[
+            crate::checklist::Component::new("b", "B", "low"),
+            crate::checklist::Component::new("a", "A", "high"),
+        ]);
+        s.set_findings("a", 2).unwrap();
+        s.set_open("a", 1).unwrap();
+        s.set_detail("a", "fixing").unwrap();
+        s
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_rows() {
+        let dir = unique_dir("roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("state.json");
+        let s = sample_state();
+        s.save(&p).unwrap();
+        let back = State::load(&p).unwrap();
+        assert_eq!(back.components.len(), 2);
+        let row = back.get("a").unwrap();
+        assert_eq!(row.findings, 2);
+        assert_eq!(row.open, 1);
+        assert_eq!(row.detail, "fixing");
+        assert_eq!(back.get("b").unwrap().phase, Phase::Pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_missing_file_is_default() {
+        let p = unique_dir("missing").join("state.json");
+        let s = State::load(&p).unwrap();
+        assert!(s.components.is_empty());
+    }
+
+    #[test]
+    fn load_corrupt_file_backs_up_and_returns_default() {
+        let dir = unique_dir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("state.json");
+        std::fs::write(&p, "{not json").unwrap();
+        let s = State::load(&p).unwrap();
+        assert!(s.components.is_empty());
+        assert!(dir.join("state.json.bad").exists());
+        assert!(
+            !p.exists(),
+            "corrupt file must be moved aside, not left in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transition_rejects_illegal_and_unknown() {
+        let mut s = sample_state();
+        let err = transition(&mut s, "a", Phase::Done)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("illegal transition"), "{err}");
+        let err = transition(&mut s, "nope", Phase::Reviewing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown component"), "{err}");
+        // Full legal chain still works end to end.
+        for to in [
+            Phase::Reviewing,
+            Phase::Fixing,
+            Phase::Verifying,
+            Phase::Committing,
+            Phase::Done,
+        ] {
+            transition(&mut s, "a", to).unwrap();
+        }
+        assert_eq!(s.get("a").unwrap().phase, Phase::Done);
+    }
+
+    #[test]
+    fn setters_reject_unknown_slug() {
+        let mut s = sample_state();
+        assert!(s.set_detail("nope", "x").is_err());
+        assert!(s.set_findings("nope", 1).is_err());
+        assert!(s.set_open("nope", 1).is_err());
+        assert!(s.get("nope").is_none());
+    }
+
+    #[test]
+    fn next_picks_lowest_tier_then_slug() {
+        let mut s = State::default();
+        s.sync(&[
+            crate::checklist::Component::new("m-b", "MB", "medium"),
+            crate::checklist::Component::new("l-a", "LA", "low"),
+            crate::checklist::Component::new("h-b", "HB", "high"),
+            crate::checklist::Component::new("h-a", "HA", "high"),
+        ]);
+        assert_eq!(s.next().unwrap().slug, "h-a");
+        transition(&mut s, "h-a", Phase::Reviewing).unwrap();
+        transition(&mut s, "h-a", Phase::Done).unwrap();
+        assert_eq!(s.next().unwrap().slug, "h-b");
+        // Unknown tiers sort after every known tier.
+        s.components.get_mut("m-b").unwrap().tier = "weird".to_string();
+        s.components.get_mut("l-a").unwrap().tier = "weird".to_string();
+        assert_eq!(s.next().unwrap().slug, "h-b");
+    }
+
+    #[test]
+    fn next_is_none_when_nothing_pending() {
+        let s = State::default();
+        assert!(s.next().is_none());
+        let mut s = sample_state();
+        for slug in ["a", "b"] {
+            transition(&mut s, slug, Phase::Reviewing).unwrap();
+            transition(&mut s, slug, Phase::Done).unwrap();
+        }
+        assert!(s.next().is_none());
+    }
+
+    #[test]
+    fn phase_as_str_covers_all_variants() {
+        assert_eq!(
+            [
+                Phase::Pending,
+                Phase::Reviewing,
+                Phase::Fixing,
+                Phase::Verifying,
+                Phase::Committing,
+                Phase::Done,
+                Phase::Failed,
+            ]
+            .map(|p| p.as_str()),
+            [
+                "pending",
+                "reviewing",
+                "fixing",
+                "verifying",
+                "committing",
+                "done",
+                "failed"
+            ]
+        );
+    }
+
+    // Liveness probing shells out to `ps` (Unix-only); on other
+    // platforms pid_alive fails open and nothing is ever swept.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_removes_only_dead_pid_temps() {
+        let dir = unique_dir("sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("state.json");
+        let live = dir.join(format!("state.json.tmp.{}.0", std::process::id()));
+        // 4199999 exceeds any real max-pid, so `ps -p` reports it dead.
+        let dead = dir.join("state.json.tmp.4199999.0");
+        let weird = dir.join("state.json.tmp.notapid.0");
+        let other = dir.join("state.json.other");
+        for f in [&live, &dead, &weird, &other] {
+            std::fs::write(f, "x").unwrap();
+        }
+        sweep_tmp_files(&p);
+        assert!(live.exists(), "live engine temp must survive");
+        assert!(!dead.exists(), "dead-pid temp must be swept");
+        assert!(weird.exists(), "unparseable temp must be left alone");
+        assert!(other.exists(), "non-temp sibling must be left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod requeue_tests {
     use super::*;
 

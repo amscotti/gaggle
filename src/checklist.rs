@@ -478,3 +478,82 @@ mod adjacency_tests {
         assert!(parse(md).is_err());
     }
 }
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    #[test]
+    fn tier_matrix() {
+        assert_eq!(Tier::parse("high"), Tier::High);
+        assert_eq!(Tier::parse(" HIGH "), Tier::High);
+        assert_eq!(Tier::parse("low"), Tier::Low);
+        // Unknown strings are Medium, never an error.
+        assert_eq!(Tier::parse("critical"), Tier::Medium);
+        assert_eq!(Tier::parse(""), Tier::Medium);
+        assert_eq!(
+            [Tier::High, Tier::Medium, Tier::Low].map(|t| (t.as_str(), t.rank())),
+            [("high", 0), ("medium", 1), ("low", 2)]
+        );
+        assert!(Tier::High.is_stronger_than(Tier::Medium));
+        assert!(Tier::Medium.is_stronger_than(Tier::Low));
+        assert!(!Tier::Low.is_stronger_than(Tier::High));
+        assert!(!Tier::High.is_stronger_than(Tier::High));
+        assert_eq!(
+            [Tier::High, Tier::Medium, Tier::Low].map(|t| t.default_priority()),
+            [100, 50, 10]
+        );
+        // Unknown tiers sort after every known tier.
+        assert_eq!(tier_rank("high"), 0);
+        assert_eq!(tier_rank("weird"), TIERS.len());
+    }
+
+    #[test]
+    fn component_new_lowercases_tier() {
+        let c = Component::new("a", "A", "HIGH");
+        assert_eq!(c.tier, "high");
+        assert!(!c.done);
+    }
+
+    #[test]
+    fn load_and_save_guards() {
+        let dir = std::env::temp_dir().join(format!(
+            "gaggle-cl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing file errors (init first); empty checklist never persists.
+        assert!(load(&dir.join("nope.md")).is_err());
+        assert!(render(&[]).is_err());
+        assert!(save(&dir.join("c.md"), &[]).is_err());
+        // Round trip preserves done, paths, and verify commands.
+        let comps = vec![Component {
+            slug: "a".into(),
+            name: "A".into(),
+            tier: "high".into(),
+            done: true,
+            paths: vec!["src/a.rs".into()],
+            verify: vec!["cargo test".into()],
+        }];
+        let p = dir.join("c.md");
+        save(&p, &comps).unwrap();
+        let back = load(&p).unwrap();
+        assert_eq!(back.len(), 1);
+        assert!(back[0].done);
+        assert_eq!(back[0].paths, vec!["src/a.rs"]);
+        assert_eq!(back[0].verify, vec!["cargo test"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_skips_empty_and_bad_markers() {
+        let md = "# Checklist\n\n## high\n- [ ]  \n- [n] ghost — Ghost\n- [ ] real — Real\n";
+        let items = parse(md).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].slug, "real");
+    }
+}

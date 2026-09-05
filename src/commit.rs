@@ -326,6 +326,226 @@ pub fn is_dirty(repo: &Path) -> Result<bool> {
 }
 
 #[cfg(test)]
+mod test_helpers {
+    use super::*;
+
+    pub fn unique_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "gaggle-commit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    pub fn init_repo(tag: &str) -> std::path::PathBuf {
+        let dir = unique_dir(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        git(&dir, &["config", "user.email", "gaggle@test"]).unwrap();
+        git(&dir, &["config", "user.name", "gaggle"]).unwrap();
+        dir
+    }
+
+    pub fn base_commit(dir: &Path) {
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(dir, &["add", "-A"]).unwrap();
+        git(
+            dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::CommitConfig;
+    use super::test_helpers::unique_dir;
+    use crate::commit::BranchConfig;
+
+    fn write_config(dir: &Path, body: &str) {
+        let review = dir.join(".review");
+        std::fs::create_dir_all(&review).unwrap();
+        std::fs::write(review.join("config.toml"), body).unwrap();
+    }
+    use std::path::Path;
+
+    #[test]
+    fn commit_config_defaults_without_file() {
+        let dir = unique_dir("cfg-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!CommitConfig::load(&dir).unwrap().sign);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_config_reads_sign_true() {
+        let dir = unique_dir("cfg-sign");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_config(&dir, "[commit]\nsign = true\n");
+        assert!(CommitConfig::load(&dir).unwrap().sign);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_config_rejects_non_bool_sign() {
+        let dir = unique_dir("cfg-sign-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_config(&dir, "[commit]\nsign = \"yes\"\n");
+        let err = CommitConfig::load(&dir).unwrap_err().to_string();
+        assert!(err.contains("commit.sign"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_config_rejects_corrupt_toml() {
+        let dir = unique_dir("cfg-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_config(&dir, "not toml [[[\n");
+        assert!(CommitConfig::load(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_config_defaults_and_reads_dedicated() {
+        let dir = unique_dir("branch-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!BranchConfig::load(&dir).unwrap().dedicated);
+        write_config(&dir, "[branch]\ndedicated = true\n");
+        assert!(BranchConfig::load(&dir).unwrap().dedicated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_config_rejects_non_bool() {
+        let dir = unique_dir("branch-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_config(&dir, "[branch]\ndedicated = 1\n");
+        let err = BranchConfig::load(&dir).unwrap_err().to_string();
+        assert!(err.contains("branch.dedicated"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod git_tests {
+    use super::test_helpers::{base_commit, init_repo};
+    use crate::commit::*;
+
+    #[test]
+    fn require_head_rejects_empty_repo() {
+        let dir = init_repo("no-head");
+        let err = require_head(&dir).unwrap_err().to_string();
+        assert!(err.contains("no commits yet"), "{err}");
+        base_commit(&dir);
+        require_head(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_branch_names_fresh_repo() {
+        let dir = init_repo("branch");
+        base_commit(&dir);
+        let name = current_branch(&dir).unwrap().expect("branch name");
+        assert!(!name.is_empty(), "expected a branch name");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_dirty_ignores_review_dir() {
+        let dir = init_repo("dirty");
+        base_commit(&dir);
+        assert!(!is_dirty(&dir).unwrap());
+        // Harness-only dirt is invisible.
+        std::fs::create_dir_all(dir.join(".review")).unwrap();
+        std::fs::write(dir.join(".review/state.json"), "{}\n").unwrap();
+        assert!(!is_dirty(&dir).unwrap());
+        // Product dirt is visible (tracked edit and untracked file).
+        std::fs::write(dir.join("base.txt"), "changed\n").unwrap();
+        assert!(is_dirty(&dir).unwrap());
+        git(&dir, &["checkout", "--", "base.txt"]).unwrap();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        assert!(is_dirty(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dirty_paths_lists_product_changes_only() {
+        let dir = init_repo("dirty-paths");
+        base_commit(&dir);
+        std::fs::write(dir.join("edit.txt"), "a\n").unwrap();
+        git(&dir, &["add", "-A"]).unwrap();
+        git(
+            &dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "add edit",
+            ],
+        )
+        .unwrap();
+        std::fs::write(dir.join("edit.txt"), "b\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "u\n").unwrap();
+        std::fs::create_dir_all(dir.join(".review")).unwrap();
+        std::fs::write(dir.join(".review/note.txt"), "n\n").unwrap();
+        let mut paths = dirty_paths(&dir).unwrap();
+        paths.sort();
+        assert_eq!(paths, vec!["edit.txt", "untracked.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_worktree_restores_tracked_and_drops_untracked() {
+        let dir = init_repo("reset");
+        base_commit(&dir);
+        std::fs::write(dir.join("base.txt"), "dirty\n").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "tmp\n").unwrap();
+        std::fs::create_dir_all(dir.join(".review")).unwrap();
+        std::fs::write(dir.join(".review/state.json"), "{}\n").unwrap();
+        reset_worktree(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            "base\n"
+        );
+        assert!(!dir.join("scratch.txt").exists());
+        assert!(dir.join(".review/state.json").exists());
+        assert!(!is_dirty(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_run_branch_off_returns_none() {
+        let dir = init_repo("nobranch");
+        base_commit(&dir);
+        assert_eq!(ensure_run_branch(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_run_branch_creates_and_reuses() {
+        let dir = init_repo("runbranch");
+        base_commit(&dir);
+        std::fs::create_dir_all(dir.join(".review")).unwrap();
+        std::fs::write(
+            dir.join(".review/config.toml"),
+            "[branch]\ndedicated = true\n",
+        )
+        .unwrap();
+        let first = ensure_run_branch(&dir).unwrap().expect("branch name");
+        assert!(first.starts_with(RUN_BRANCH_PREFIX), "{first}");
+        let second = ensure_run_branch(&dir).unwrap().expect("branch name");
+        assert_eq!(first, second, "resumed run must reuse its branch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

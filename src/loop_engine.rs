@@ -2268,6 +2268,222 @@ fn remove_dropped_findings(review_dir: &Path, dropped: &[String]) {
 }
 
 #[cfg(test)]
+mod scaffold_tests {
+    use super::*;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "gaggle-scaffold-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn init_with_explicit_components_scaffolds_review_dir() {
+        let dir = unique_dir("init");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = init(
+            &dir,
+            &[
+                ("core".into(), "Core".into(), "HIGH".into()),
+                ("api".into(), "API".into(), "low".into()),
+            ],
+        )
+        .unwrap();
+        assert!(out.is_empty(), "explicit init discovers nothing");
+        let review = dir.join(".review");
+        assert!(review.join("checklist.md").exists());
+        assert!(review.join("config.toml").exists());
+        let state = State::load(&review.join("state.json")).unwrap();
+        assert_eq!(state.components.len(), 2);
+        // Tiers canonicalized through Component::new.
+        assert_eq!(state.get("core").unwrap().tier, "high");
+        assert_eq!(state.get("api").unwrap().phase, Phase::Pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_strict_missing_is_default_and_corrupt_errors() {
+        let dir = unique_dir("strict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("state.json");
+        assert!(load_state_strict(&p).unwrap().components.is_empty());
+        std::fs::write(&p, "{bad").unwrap();
+        let err = load_state_strict(&p).unwrap_err().to_string();
+        assert!(err.contains("corrupt"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_status_warns_only_for_active_phases() {
+        let dir = unique_dir("live");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(&review).unwrap();
+        // No status file and corrupt files are quiet.
+        assert!(!warn_if_status_looks_live(&review));
+        std::fs::write(review.join("status.json"), "{bad").unwrap();
+        assert!(!warn_if_status_looks_live(&review));
+        let write = |phase: &str| {
+            let s = crate::status::Status {
+                phase: phase.into(),
+                component: "-".into(),
+                detail: "x".into(),
+                ts: "t".into(),
+            };
+            std::fs::write(
+                review.join("status.json"),
+                serde_json::to_string(&s).unwrap(),
+            )
+            .unwrap();
+        };
+        write("idle");
+        assert!(!warn_if_status_looks_live(&review));
+        write("done");
+        assert!(!warn_if_status_looks_live(&review));
+        write("reviewing");
+        assert!(warn_if_status_looks_live(&review));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_refresh_keeps_progress_and_classifies_delta() {
+        let mut state = State::default();
+        state.sync(&[
+            Component::new("core", "Core", "high"),
+            Component::new("api", "API", "medium"),
+            Component::new("old", "Old", "low"),
+        ]);
+        // Record progress: core done with findings + commit, api quarantined.
+        for to in [
+            Phase::Reviewing,
+            Phase::Fixing,
+            Phase::Verifying,
+            Phase::Committing,
+            Phase::Done,
+        ] {
+            state::transition(&mut state, "core", to).unwrap();
+        }
+        state.set_findings("core", 5).unwrap();
+        state.components.get_mut("core").unwrap().commit = Some("abc".into());
+        state.components.get_mut("core").unwrap().verify = vec!["make x".into()];
+        state::transition(&mut state, "api", Phase::Reviewing).unwrap();
+        state::transition(&mut state, "api", Phase::Failed).unwrap();
+
+        let snapshot = state.components.clone();
+        let old_slugs = vec![
+            "core".to_string(),
+            "api".to_string(),
+            "old".to_string(),
+            "extra".to_string(), // checklist-only row, never in state
+        ];
+        let mut list = vec![
+            Component::new("core", "Core", "high"),
+            Component::new("api", "API", "medium"),
+            Component::new("new", "New", "low"),
+        ];
+        let delta = apply_refresh(&snapshot, &old_slugs, &mut list, &mut state);
+        assert_eq!(delta.added, vec!["new".to_string()]);
+        assert_eq!(delta.kept.len(), 2);
+        assert!(delta.dropped.contains(&"old".to_string()));
+        assert!(delta.dropped.contains(&"extra".to_string()));
+        // Done progress survives the rediscovery: checklist marked done,
+        // state row keeps phase/findings/commit.
+        assert!(list.iter().find(|c| c.slug == "core").unwrap().done);
+        let row = state.get("core").unwrap();
+        assert_eq!(row.phase, Phase::Done);
+        assert_eq!(row.findings, 5);
+        assert_eq!(row.commit.as_deref(), Some("abc"));
+        // Empty rediscovered verify inherits the snapshot's commands.
+        assert_eq!(
+            list.iter().find(|c| c.slug == "core").unwrap().verify,
+            vec!["make x"]
+        );
+        // Failed stays failed until an explicit requeue.
+        assert_eq!(state.get("api").unwrap().phase, Phase::Failed);
+        // Dropped slugs leave state entirely.
+        assert!(state.get("old").is_none());
+    }
+
+    #[test]
+    fn requeue_needs_state_and_failed_rows() {
+        let dir = unique_dir("requeue-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = requeue(&dir, &[], true).unwrap_err().to_string();
+        assert!(err.contains("nothing to requeue"), "{err}");
+        let err = restart(&dir).unwrap_err().to_string();
+        assert!(err.contains("run `gaggle init` first"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requeue_and_restart_roundtrip() {
+        let dir = unique_dir("requeue-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        init(
+            &dir,
+            &[
+                ("core".into(), "Core".into(), "high".into()),
+                ("api".into(), "API".into(), "low".into()),
+            ],
+        )
+        .unwrap();
+        // Nothing quarantined: --all is a successful no-op.
+        assert!(requeue(&dir, &[], true).unwrap().is_empty());
+        // Unknown slugs and non-quarantined rows are rejected.
+        let err = requeue(&dir, &["nope".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown component"), "{err}");
+        let err = requeue(&dir, &["core".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not failed"), "{err}");
+        // Quarantine core, then requeue it back to pending.
+        let state_path = dir.join(".review/state.json");
+        let mut state = State::load(&state_path).unwrap();
+        state::transition(&mut state, "core", Phase::Reviewing).unwrap();
+        state::transition(&mut state, "core", Phase::Failed).unwrap();
+        state.set_detail("core", "flake").unwrap();
+        state.save(&state_path).unwrap();
+        assert_eq!(
+            requeue(&dir, &["core".to_string()], false).unwrap(),
+            vec!["core"]
+        );
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Pending);
+        assert!(
+            state.get("core").unwrap().detail.contains("requeued"),
+            "requeue must note the prior detail"
+        );
+        // Restart resets every row for a fresh pass.
+        assert_eq!(restart(&dir).unwrap(), 2);
+        let state = State::load(&state_path).unwrap();
+        assert!(
+            state.components.values().all(|c| c.phase == Phase::Pending),
+            "restart must reset all rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_dropped_findings_deletes_only_listed() {
+        let dir = unique_dir("findings");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        std::fs::write(review.join("findings").join("gone.txt"), "x").unwrap();
+        std::fs::write(review.join("findings").join("kept.txt"), "y").unwrap();
+        remove_dropped_findings(&review, &["gone".to_string()]);
+        assert!(!review.join("findings").join("gone.txt").exists());
+        assert!(review.join("findings").join("kept.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
