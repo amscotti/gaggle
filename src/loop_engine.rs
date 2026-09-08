@@ -61,6 +61,15 @@ impl Engine {
         self.review_dir.join("state.json")
     }
 
+    /// Best-effort phase telemetry: a failed status write (disk full,
+    /// permissions, transient lock) must never abort a run that is
+    /// otherwise healthy. Failures warn; the run continues.
+    fn report_status(&self, phase: StatusPhase, component: &str, detail: &str) {
+        if let Err(e) = status::report(&self.review_dir, phase, component, detail) {
+            eprintln!("  ⚠ status telemetry failed (continuing): {e:#}");
+        }
+    }
+
     /// Review-only pass: review EVERY checklist component and record
     /// findings files, but never fix, verify, or commit. The on-disk state
     /// machine is untouched (a later `gaggle run` proceeds normally);
@@ -97,24 +106,18 @@ impl Engine {
             (checklist::tier_rank(&a.tier), &a.slug).cmp(&(checklist::tier_rank(&b.tier), &b.slug))
         });
 
-        status::report(
-            &self.review_dir,
+        self.report_status(
             StatusPhase::Picking,
             "-",
             &format!("review-only pass started ({} components)", ordered.len()),
-        )?;
+        );
 
         let mut total_findings = 0usize;
         let mut clean = 0usize;
         let mut errors = 0usize;
         for comp in &ordered {
             println!("\n=== {} — {} (review only) ===", comp.slug, comp.name);
-            status::report(
-                &self.review_dir,
-                StatusPhase::Reviewing,
-                &comp.slug,
-                "review agent starting",
-            )?;
+            self.report_status(StatusPhase::Reviewing, &comp.slug, "review agent starting");
             match self.review_component(&scratch, &comp.slug) {
                 Ok(findings) => {
                     println!("  review: {} finding(s)", findings.len());
@@ -154,15 +157,14 @@ impl Engine {
             }
         }
 
-        status::report(
-            &self.review_dir,
+        self.report_status(
             StatusPhase::Idle,
             "-",
             &format!(
                 "review-only pass complete: {} finding(s), {} clean, {} error(s)",
                 total_findings, clean, errors
             ),
-        )?;
+        );
         println!(
             "\nreview-only pass complete: {} component(s) — {} finding(s), {} clean, {} error(s)",
             ordered.len(),
@@ -256,7 +258,7 @@ impl Engine {
         // an existing gaggle/run-* branch is reused, not forked.
         *self.run_branch.borrow_mut() = commit::ensure_run_branch(&self.repo)?;
 
-        status::report(&self.review_dir, StatusPhase::Picking, "-", "loop started")?;
+        self.report_status(StatusPhase::Picking, "-", "loop started");
 
         while let Some(next) = state.next().cloned() {
             let comp = Component::new(&next.slug, &next.name, &next.tier);
@@ -283,8 +285,7 @@ impl Engine {
             .map(|c| c.slug.as_str())
             .collect();
         if !final_gate.passed {
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Failed,
                 "-",
                 &format!(
@@ -296,27 +297,25 @@ impl Engine {
                     },
                     final_gate.failed_command.clone().unwrap_or_default()
                 ),
-            )?;
+            );
         } else if !quarantined.is_empty() {
             // Gate is green; leftover quarantine is leftover work, not a
             // failed run. `gaggle status` used to show Failed here and
             // look like the suite never passed.
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Done,
                 "-",
                 &format!(
                     "final verify green; quarantined (requeue to retry): {}",
                     quarantined.join(", ")
                 ),
-            )?;
+            );
         } else {
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Done,
                 "-",
                 "all components done, final verify green",
-            )?;
+            );
         }
         if let Err(e) = self.generate_report(&state, &final_gate) {
             eprintln!("  warning: final report generation failed: {e:#}");
@@ -470,7 +469,7 @@ impl Engine {
     /// the cycle budget (or a persistent environmental failure) leaves
     /// the gate red for the caller to fail the process.
     fn close_final_gate(&self, state: &mut State) -> Result<verify::RunResult> {
-        let mut gate = self.run_final_verify();
+        let gate = self.run_final_verify();
         if gate.passed {
             return Ok(gate);
         }
@@ -480,7 +479,39 @@ impl Engine {
             .keys()
             .map(|slug| (slug.clone(), read_optional(&self.findings_path(slug))))
             .collect();
+        let result = self.run_gate_fix_loop(state, gate);
+        // Every exit restores the pre-gate findings files: each fix cycle
+        // overwrites the touched component's file with SYNTHETIC gate
+        // content, and a findings file's presence means unresolved
+        // component findings. Restoring only on commit left the synthetic
+        // file behind on fix-error, tamper, budget-exhausted, and
+        // commit-failure exits.
+        self.restore_findings_snapshots(&originals);
+        let gate = result?;
+        if !gate.passed {
+            commit::reset_worktree(&self.repo)?;
+        }
+        Ok(gate)
+    }
 
+    /// Restore pre-gate findings-file snapshots (see [`Engine::close_final_gate`]).
+    fn restore_findings_snapshots(
+        &self,
+        originals: &std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for (slug, prior) in originals {
+            restore_optional(&self.findings_path(slug), prior.as_deref());
+        }
+    }
+
+    /// Fix-and-retry loop for a red full-suite gate (extracted so
+    /// [`Engine::close_final_gate`] can restore findings snapshots on every
+    /// exit, including early `return`s below).
+    fn run_gate_fix_loop(
+        &self,
+        state: &mut State,
+        mut gate: verify::RunResult,
+    ) -> Result<verify::RunResult> {
         let mut cycles = 0usize;
         let mut env_retries = 0usize;
         while !gate.passed && cycles < MAX_FIX_CYCLES {
@@ -509,12 +540,11 @@ impl Engine {
             println!("\n=== full-gate fix {cycles}/{MAX_FIX_CYCLES} ===");
 
             let slug = classified.component.clone();
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Fixing,
                 &slug,
                 &format!("full-gate fix {cycles}/{MAX_FIX_CYCLES} — {slug}"),
-            )?;
+            );
             let finding = gate_finding(&gate, &classified.diagnostics);
             let outcome = match self.fix_component(state, &slug, &[finding]) {
                 Ok(o) => o,
@@ -539,12 +569,11 @@ impl Engine {
                 continue;
             }
 
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Verifying,
                 &slug,
                 "re-running full-suite verify after gate fix",
-            )?;
+            );
             gate = self.run_final_verify();
             if !gate.passed {
                 continue;
@@ -554,10 +583,6 @@ impl Engine {
             match commit::commit_dirty(&self.repo, &msg) {
                 Ok(h) if !h.is_empty() => {
                     println!("  commit: {h}");
-                    restore_optional(
-                        &self.findings_path(&slug),
-                        originals.get(&slug).and_then(|o| o.as_deref()),
-                    );
                     if let Some(c) = state.components.get_mut(&slug) {
                         c.commit = Some(h.clone());
                         c.detail = format!("fixed full-suite verify {h}");
@@ -566,10 +591,6 @@ impl Engine {
                 }
                 Ok(_) => {
                     println!("  commit: nothing new (tree already matches HEAD)");
-                    restore_optional(
-                        &self.findings_path(&slug),
-                        originals.get(&slug).and_then(|o| o.as_deref()),
-                    );
                 }
                 Err(e) => {
                     eprintln!("  commit FAILED after green full gate: {e:#}");
@@ -578,9 +599,6 @@ impl Engine {
             }
         }
 
-        if !gate.passed {
-            commit::reset_worktree(&self.repo)?;
-        }
         Ok(gate)
     }
 
@@ -860,12 +878,7 @@ impl Engine {
 
         state::transition(state, &slug, Phase::Reviewing)?;
         state.save(&self.state_path())?;
-        status::report(
-            &self.review_dir,
-            StatusPhase::Reviewing,
-            &slug,
-            "review agent starting",
-        )?;
+        self.report_status(StatusPhase::Reviewing, &slug, "review agent starting");
 
         // Goose dying is a retry, not a quarantine. Only after the
         // attempt budget is spent do we park this component and move on.
@@ -885,12 +898,11 @@ impl Engine {
                     eprintln!(
                         "  review attempt {attempt}/{MAX_FIX_CYCLES} failed: {review_err} — retrying"
                     );
-                    status::report(
-                        &self.review_dir,
+                    self.report_status(
                         StatusPhase::Reviewing,
                         &slug,
                         &format!("review agent failed ({attempt}/{MAX_FIX_CYCLES}) — retrying"),
-                    )?;
+                    );
                 }
             }
         }
@@ -915,7 +927,7 @@ impl Engine {
             }
             state::transition(state, &slug, Phase::Done)?;
             state.set_detail(&slug, "clean review — no findings")?;
-            status::report(&self.review_dir, StatusPhase::Done, &slug, "no findings")?;
+            self.report_status(StatusPhase::Done, &slug, "no findings");
             return Ok(());
         }
 
@@ -932,8 +944,7 @@ impl Engine {
                 state::transition(state, &slug, Phase::Fixing)?;
             }
             state.save(&self.state_path())?;
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Fixing,
                 &slug,
                 &format!(
@@ -941,7 +952,7 @@ impl Engine {
                     MAX_FIX_CYCLES,
                     findings.len()
                 ),
-            )?;
+            );
 
             let work_order = findings.clone();
             // Goose flake/kill: spend this cycle, keep the work order,
@@ -960,12 +971,7 @@ impl Engine {
 
             state::transition(state, &slug, Phase::Verifying)?;
             state.save(&self.state_path())?;
-            status::report(
-                &self.review_dir,
-                StatusPhase::Verifying,
-                &slug,
-                "verify commands running",
-            )?;
+            self.report_status(StatusPhase::Verifying, &slug, "verify commands running");
 
             let v = self.verify_until_stable(state, &slug)?;
             if v.passed {
@@ -1001,12 +1007,11 @@ impl Engine {
                         return self.quarantine(state, &slug, &why);
                     }
                 }
-                status::report(
-                    &self.review_dir,
+                self.report_status(
                     StatusPhase::Reviewing,
                     &slug,
                     "confirming work-order findings",
-                )?;
+                );
                 // A confirm recipe flake must not close the work order.
                 // The commit already landed — treat findings as still
                 // open so the next cycle retries rather than claiming
@@ -1115,7 +1120,7 @@ impl Engine {
         }
         state::transition(state, slug, Phase::Committing)?;
         state::transition(state, slug, Phase::Done)?;
-        status::report(&self.review_dir, StatusPhase::Done, slug, &detail)?;
+        self.report_status(StatusPhase::Done, slug, &detail);
         println!("  ✓ {slug}: {detail}");
         Ok(())
     }
@@ -1139,7 +1144,7 @@ impl Engine {
         commit::reset_worktree(&self.repo)?;
         state.set_detail(slug, why)?;
         state::transition(state, slug, Phase::Failed)?;
-        status::report(&self.review_dir, StatusPhase::Failed, slug, why)?;
+        self.report_status(StatusPhase::Failed, slug, why);
         println!("  ✗ {slug}: {why}");
         Ok(())
     }
@@ -1640,6 +1645,12 @@ fn parse_findings(result: &Value) -> Result<Vec<String>> {
 /// Confirmation result. Missing/malformed `still_open` is treated as empty
 /// so a green verify is not reopened by a bad confirm payload.
 fn parse_still_open(result: &Value) -> Result<Vec<String>> {
+    // The confirm recipe contract ends every answer with
+    // `{"still_open": [...]}` (empty array = work order closed). A missing
+    // or misshapen key is a malformed answer, NOT a closed work order: the
+    // caller treats Err as "keep everything open", while Ok(empty) commits
+    // to done. Collapsing malformed into empty silently closed committed
+    // work the agent never confirmed.
     match result.get("still_open") {
         Some(Value::Array(items)) => {
             let mut out = Vec::new();
@@ -1652,11 +1663,20 @@ fn parse_still_open(result: &Value) -> Result<Vec<String>> {
             Ok(out)
         }
         Some(Value::String(s)) if !s.trim().is_empty() => Ok(vec![s.trim().to_string()]),
-        None | Some(Value::Null) | Some(Value::String(_)) => Ok(Vec::new()),
-        Some(other) => {
-            eprintln!("  confirm: unexpected still_open shape ({other}), treating as empty");
-            Ok(Vec::new())
+        missing => {
+            bail!(
+                "confirm answer has no usable `still_open` array (got {missing:?}) — keeping the work order open"
+            )
         }
+    }
+}
+
+/// Best-effort phase telemetry for free-function ops (init / refresh /
+/// requeue / restart): warn instead of failing the op on a status-write
+/// error. Method paths use `Engine::report_status`.
+fn report_status(review_dir: &Path, phase: StatusPhase, component: &str, detail: &str) {
+    if let Err(e) = status::report(review_dir, phase, component, detail) {
+        eprintln!("  ⚠ status telemetry failed (continuing): {e:#}");
     }
 }
 
@@ -1692,12 +1712,12 @@ pub fn init(
         warn_missing_paths(repo, &list);
         checklist::save(&review.join("checklist.md"), &list)?;
         state.save(&review.join("state.json"))?;
-        status::report(
+        report_status(
             &review,
             StatusPhase::Idle,
             "-",
             "initialized (explicit components)",
-        )?;
+        );
         return Ok(Vec::new());
     }
 
@@ -1708,12 +1728,12 @@ pub fn init(
     let mut state = State::default();
     state.sync(&list);
     state.save(&review.join("state.json"))?;
-    status::report(
+    report_status(
         &review,
         StatusPhase::Idle,
         "-",
         "initialized (ai-discovery)",
-    )?;
+    );
     Ok(discovered.components)
 }
 
@@ -1878,6 +1898,12 @@ pub fn history(repo: &Path, ts: Option<&str>) -> Result<()> {
 
     match ts {
         Some(ts) => {
+            // Allowlist against the listed archive names: a raw
+            // `runs_dir.join(ts)` would let `../` or an absolute path
+            // escape `.review/runs/` and read an arbitrary final-report.md.
+            if !entries.iter().any(|e| e == ts) {
+                bail!("no archived run named {ts:?} — try `gaggle history` for the list");
+            }
             let dir = runs_dir.join(ts);
             if !dir.is_dir() {
                 bail!("no archived run named {ts:?} — try `gaggle history` for the list");
@@ -2006,7 +2032,8 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
         return Ok(Vec::new());
     }
 
-    let mut requeued = Vec::new();
+    // Validate every target BEFORE mutating: a bad slug must fail the whole
+    // op with nothing half-applied (and nothing falsely reported).
     for slug in &targets {
         let phase = state
             .get(slug)
@@ -2019,6 +2046,10 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
                 phase.as_str()
             );
         }
+    }
+
+    let mut requeued = Vec::new();
+    for slug in &targets {
         state::transition(&mut state, slug, Phase::Pending)?;
         let prior = state
             .get(slug)
@@ -2026,13 +2057,16 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
             .unwrap_or_default();
         state.set_detail(slug, &format!("requeued (previously: {})", prior.trim()))?;
         state.set_open(slug, 0)?;
+        // Persist per slug, printing only after the save: the old code
+        // printed "requeued" inside the loop but saved once after it, so a
+        // crash lost already-reported requeues.
+        state.save(&state_path)?;
         requeued.push(slug.clone());
         println!("  requeued {slug}");
     }
 
-    state.save(&state_path)?;
     persist_checklist(&review_dir, &state)?;
-    status::report(
+    report_status(
         &review_dir,
         StatusPhase::Idle,
         "-",
@@ -2041,7 +2075,7 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
             requeued.len(),
             requeued.join(", ")
         ),
-    )?;
+    );
     Ok(requeued)
 }
 
@@ -2060,17 +2094,33 @@ pub fn restart(repo: &Path) -> Result<usize> {
     if state.components.is_empty() {
         bail!("state has no components — run `gaggle init` first");
     }
+    // Same guard as `refresh`: restarting mid-run would wipe in-flight
+    // progress (active phases reset to pending, findings cleared).
+    if let Some(c) = state.components.values().find(|c| {
+        matches!(
+            c.phase,
+            Phase::Reviewing | Phase::Fixing | Phase::Verifying | Phase::Committing
+        )
+    }) {
+        bail!(
+            "cannot restart while a component is in an active phase ({} is {}). \
+             Wait for `gaggle run` to finish, or interrupt it.",
+            c.slug,
+            c.phase.as_str()
+        );
+    }
+    warn_if_status_looks_live(&review_dir);
     let n = state.components.len();
     state.restart_all();
     state.save(&state_path)?;
     persist_checklist(&review_dir, &state)?;
     clear_current_run_artifacts(&review_dir)?;
-    status::report(
+    report_status(
         &review_dir,
         StatusPhase::Idle,
         "-",
         &format!("restarted {n} component(s) to pending"),
-    )?;
+    );
     Ok(n)
 }
 
@@ -2155,7 +2205,7 @@ pub fn refresh(repo: &Path) -> Result<RefreshDelta> {
     checklist::save(&checklist_path, &list)?;
     state.save(&state_path)?;
     remove_dropped_findings(&review_dir, &delta.dropped);
-    status::report(
+    report_status(
         &review_dir,
         StatusPhase::Idle,
         "-",
@@ -2165,7 +2215,7 @@ pub fn refresh(repo: &Path) -> Result<RefreshDelta> {
             delta.dropped.len(),
             delta.kept.len()
         ),
-    )?;
+    );
     Ok(delta)
 }
 
@@ -2470,6 +2520,132 @@ mod scaffold_tests {
     }
 
     #[test]
+    fn restart_refuses_active_phases() {
+        let dir = unique_dir("restart-active");
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir, &[("core".into(), "Core".into(), "high".into())]).unwrap();
+        let state_path = dir.join(".review/state.json");
+        let mut state = State::load(&state_path).unwrap();
+        state::transition(&mut state, "core", Phase::Reviewing).unwrap();
+        state.save(&state_path).unwrap();
+        let err = restart(&dir).unwrap_err().to_string();
+        assert!(err.contains("active phase"), "{err}");
+        // Nothing was wiped by the refused restart.
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Reviewing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requeue_validates_all_before_mutating() {
+        let dir = unique_dir("requeue-atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        init(
+            &dir,
+            &[
+                ("core".into(), "Core".into(), "high".into()),
+                ("api".into(), "API".into(), "low".into()),
+            ],
+        )
+        .unwrap();
+        let state_path = dir.join(".review/state.json");
+        let mut state = State::load(&state_path).unwrap();
+        for slug in ["core", "api"] {
+            state::transition(&mut state, slug, Phase::Reviewing).unwrap();
+            state::transition(&mut state, slug, Phase::Failed).unwrap();
+        }
+        state.save(&state_path).unwrap();
+        // One bad slug fails the whole op — the good slug stays queued.
+        let err = requeue(&dir, &["core".to_string(), "nope".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown component"), "{err}");
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Failed);
+        assert_eq!(state.get("api").unwrap().phase, Phase::Failed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_rejects_run_ids_outside_the_archive() {
+        let dir = unique_dir("history");
+        let runs = dir.join(".review/runs");
+        let ts = "20240101-000000";
+        std::fs::create_dir_all(runs.join(ts)).unwrap();
+        std::fs::write(runs.join(ts).join("final-report.md"), "# report\n").unwrap();
+        // A plant outside the archive that traversal would resolve to.
+        std::fs::create_dir_all(dir.join("secret")).unwrap();
+        std::fs::write(dir.join("secret/final-report.md"), "SECRET\n").unwrap();
+        // Legitimate ids still work (list and detail).
+        history(&dir, Some(ts)).unwrap();
+        history(&dir, None).unwrap();
+        // Traversal, absolute, and unknown ids are all rejected.
+        for evil in [
+            "../secret",
+            "../runs/20240101-000000",
+            "..",
+            ".",
+            "/tmp",
+            "nope",
+        ] {
+            let err = history(&dir, Some(evil)).unwrap_err().to_string();
+            assert!(err.contains("no archived run"), "{evil}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_never_fails_the_caller() {
+        // status::report on an unwritable review dir errors — the
+        // best-effort wrappers must swallow that, never abort the op.
+        let dir = unique_dir("telemetry");
+        std::fs::write(&dir, "a file, not a directory").unwrap();
+        assert!(status::report(&dir, StatusPhase::Idle, "-", "x").is_err());
+        let engine = Engine::new(&dir);
+        engine.report_status(StatusPhase::Idle, "-", "x");
+        report_status(&dir, StatusPhase::Idle, "-", "x");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn findings_snapshots_restore_prior_content_and_remove_synthetic() {
+        let dir = unique_dir("restore");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        let engine = Engine::new(&dir);
+        // Pre-gate state: core has real leftovers, api has no file.
+        std::fs::write(review.join("findings").join("core.txt"), "real leftovers").unwrap();
+        let mut snaps = std::collections::BTreeMap::new();
+        snaps.insert(
+            "core".to_string(),
+            read_optional(&engine.findings_path("core")),
+        );
+        snaps.insert(
+            "api".to_string(),
+            read_optional(&engine.findings_path("api")),
+        );
+        // Gate-fix cycles overwrite core's file and create api's…
+        std::fs::write(
+            review.join("findings").join("core.txt"),
+            "FULL-SUITE synthetic",
+        )
+        .unwrap();
+        std::fs::write(
+            review.join("findings").join("api.txt"),
+            "FULL-SUITE synthetic",
+        )
+        .unwrap();
+        engine.restore_findings_snapshots(&snaps);
+        // …and every exit restores the pre-gate state.
+        assert_eq!(
+            std::fs::read_to_string(review.join("findings").join("core.txt")).unwrap(),
+            "real leftovers"
+        );
+        assert!(!review.join("findings").join("api.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remove_dropped_findings_deletes_only_listed() {
         let dir = unique_dir("findings");
         let review = dir.join(".review");
@@ -2528,9 +2704,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_still_open_is_empty() {
-        let v = json!({"status": "ok"});
-        assert!(parse_still_open(&v).unwrap().is_empty());
+    fn missing_still_open_is_malformed_not_closed() {
+        // A missing/null/empty/misshapen key must NOT read as "closed":
+        // the caller keeps the work order open on Err.
+        for v in [
+            json!({"status": "ok"}),
+            json!({"still_open": null}),
+            json!({"still_open": ""}),
+            json!({"still_open": 42}),
+        ] {
+            let err = parse_still_open(&v).unwrap_err().to_string();
+            assert!(err.contains("still_open"), "{v}: {err}");
+        }
+        // …while an explicit empty array still closes the work order.
+        assert!(
+            parse_still_open(&json!({"still_open": []}))
+                .unwrap()
+                .is_empty()
+        );
+        // …and a lone string stays a lenient single-item read.
+        assert_eq!(
+            parse_still_open(&json!({"still_open": "leak"})).unwrap(),
+            vec!["leak"]
+        );
     }
 
     #[test]

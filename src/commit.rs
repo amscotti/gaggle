@@ -178,12 +178,49 @@ pub fn ensure_run_branch(repo: &Path) -> Result<Option<String>> {
         }
     }
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let name = format!("{RUN_BRANCH_PREFIX}{ts}");
+    // Second-resolution timestamps collide when two runs start in the same
+    // second (or a stale branch survived): `switch -c` would fail outright.
+    // Suffix instead — the branch is still unique and sortable.
+    let name = run_branch_name(repo, &ts.to_string())?;
     git(repo, &["switch", "-c", &name])?;
     println!(
         "  branch: created dedicated run branch {name} (commits land here, not your working branch)"
     );
     Ok(Some(name))
+}
+
+/// Pick a fresh `gaggle/run-<ts>[-n]` branch name. Separated from
+/// [`ensure_run_branch`] (which stamps the current time) so the collision
+/// walk is unit-testable with a fixed timestamp.
+fn run_branch_name(repo: &Path, ts: &str) -> Result<String> {
+    let base = format!("{RUN_BRANCH_PREFIX}{ts}");
+    if !branch_exists(repo, &base) {
+        return Ok(base);
+    }
+    for n in 2..=1000u32 {
+        let name = format!("{base}-{n}");
+        if !branch_exists(repo, &name) {
+            return Ok(name);
+        }
+    }
+    bail!("too many {base}* branches exist — delete stale gaggle/run-* branches and retry")
+}
+
+/// True when a local branch already exists (probe, not an error, so a
+/// missing ref or a bare directory simply means "available").
+fn branch_exists(repo: &Path, name: &str) -> bool {
+    git_cmd(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{name}"),
+        ],
+    )
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
 /// Current branch name (None in detached-HEAD state).
@@ -346,6 +383,10 @@ mod test_helpers {
         git(&dir, &["init", "-q"]).unwrap();
         git(&dir, &["config", "user.email", "gaggle@test"]).unwrap();
         git(&dir, &["config", "user.name", "gaggle"]).unwrap();
+        // Deterministic line endings: Windows runners default to
+        // core.autocrlf=true, which checks text files out as CRLF and
+        // breaks byte-exact content assertions (local-only setting).
+        git(&dir, &["config", "core.autocrlf", "false"]).unwrap();
         dir
     }
 
@@ -432,7 +473,7 @@ mod config_tests {
 
 #[cfg(test)]
 mod git_tests {
-    use super::test_helpers::{base_commit, init_repo};
+    use super::test_helpers::{base_commit, init_repo, unique_dir};
     use crate::commit::*;
 
     #[test]
@@ -525,6 +566,33 @@ mod git_tests {
         base_commit(&dir);
         assert_eq!(ensure_run_branch(&dir).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_branch_name_suffixes_on_collision() {
+        let dir = init_repo("branchname");
+        base_commit(&dir);
+        // No collision: the plain timestamp name.
+        assert_eq!(
+            run_branch_name(&dir, "20240101-000000").unwrap(),
+            "gaggle/run-20240101-000000"
+        );
+        // Two runs in the same second (or a stale branch): walk -2, -3…
+        git(&dir, &["branch", "gaggle/run-20240101-000000"]).unwrap();
+        git(&dir, &["branch", "gaggle/run-20240101-000000-2"]).unwrap();
+        assert_eq!(
+            run_branch_name(&dir, "20240101-000000").unwrap(),
+            "gaggle/run-20240101-000000-3"
+        );
+        // Outside any repo every name is "available" — never an error.
+        let bare = unique_dir("branchname-bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            run_branch_name(&bare, "20240101-000000").unwrap(),
+            "gaggle/run-20240101-000000"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     #[test]

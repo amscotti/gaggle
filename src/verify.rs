@@ -642,8 +642,9 @@ fn run_shell(
                     kill = Some(VerifyKill::Timeout {
                         after: timeout.unwrap_or_default(),
                     });
+                    // kill_tree reaps (bounded, with SIGKILL escalation)
+                    // so OUR pipe ends close and the drain threads finish.
                     kill_tree(&mut child);
-                    let _ = child.wait(); // reap so OUR pipes close
                     status_success = false;
                     break;
                 }
@@ -669,7 +670,6 @@ fn run_shell(
                         idle: stall.unwrap_or_default(),
                     });
                     kill_tree(&mut child);
-                    let _ = child.wait();
                     status_success = false;
                     break;
                 }
@@ -711,25 +711,70 @@ fn run_shell(
     })
 }
 
-/// Kill the child and (on Unix) its whole process group so descendants
+/// Grace period for SIGTERM before escalating: long enough for a healthy
+/// tree to flush and exit, short enough that a hung gate stays bounded.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Wait up to `limit` for the child to exit, polling with `try_wait` (which
+/// reaps on success). Returns true when the child was reaped. Never blocks
+/// longer than `limit` — the gate must survive even an unkillable child.
+fn wait_bounded(child: &mut std::process::Child, limit: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if start.elapsed() >= limit {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Signal the child and (on Unix) its whole process group so descendants
 /// don't survive to hold pipes or CPU.
-fn kill_tree(child: &mut std::process::Child) {
+fn signal_tree(child: &mut std::process::Child, sig: &str) {
     #[cfg(not(windows))]
     {
         // process_group(0) made the child a group leader: pgid == pid.
         let pgid = child.id();
-        let kill = Command::new("kill")
-            .arg("-TERM")
+        let signaled = Command::new("kill")
+            .arg(sig)
             .arg(format!("-{pgid}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        if kill.map(|s| s.success()).unwrap_or(false) {
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if signaled {
             return;
         }
     }
+    #[cfg(windows)]
+    {
+        let _ = sig;
+    }
     let _ = child.kill();
+}
+
+/// Kill the process tree and reap it, never blocking the gate. SIGTERM
+/// first (lets healthy trees flush); on timeout escalate to SIGKILL so a
+/// TERM-ignoring command cannot deadlock `run_shell` in `child.wait()`.
+/// If the child still refuses to die (unkillable sleep), the gate moves on
+/// — the OS reaps it when this process exits.
+fn kill_tree(child: &mut std::process::Child) {
+    signal_tree(child, "-TERM");
+    if wait_bounded(child, KILL_GRACE) {
+        return;
+    }
+    eprintln!("  ⚠ verify command ignored SIGTERM — escalating to SIGKILL");
+    signal_tree(child, "-KILL");
+    let _ = child.kill();
+    wait_bounded(child, KILL_GRACE);
 }
 
 /// Sum CPU time of processes in `pgid`, in milliseconds. `None` when we
@@ -1206,6 +1251,36 @@ mod timeout_tests {
             !result.output.contains("timed out"),
             "must not kill when timeout is unset: {}",
             result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn term_ignoring_command_is_sigkilled_not_deadlocked() {
+        // `trap '' TERM` makes the shell ignore SIGTERM: the old
+        // kill-then-unbounded-wait deadlocked here until `sleep` exited
+        // on its own (~31s). SIGKILL escalation must bound the kill.
+        let dir = temp_repo();
+        let start = std::time::Instant::now();
+        let result = run_commands_timed(
+            &dir,
+            &["trap '' TERM; sleep 30".to_string()],
+            Some(Duration::from_secs(1)),
+            None,
+            false,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(!result.passed);
+        assert!(
+            matches!(result.kill, Some(VerifyKill::Timeout { .. })),
+            "expected a timeout kill, got {:?}",
+            result.kill
+        );
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "kill was not bounded — took {elapsed:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

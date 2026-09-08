@@ -336,17 +336,54 @@ fn is_recipe_banner_continuation(line: &str) -> bool {
         || is_recipe_param_line(t)
 }
 
-/// Goose lists recipe params as `snake_case: value` (optional indent).
+/// Every `key=value` pair the harness passes to `goose run --params` (see the
+/// `params` arrays at the `run_recipe` call sites). The recipe-load banner
+/// echoes them back as `key: value` lines; only those lines are banner
+/// continuations. Anything else (`warning: …`, `error: …`, rust traces) is
+/// real stderr and must be surfaced, never stripped. If a new recipe param
+/// is added, add its key here too — otherwise its banner line leaks into
+/// the warnings output (noisy but harmless, and covered by test).
+const RECIPE_PARAM_KEYS: &[&str] = &[
+    "component",
+    "component_name",
+    "component_paths",
+    "components_file",
+    "diagnostics_file",
+    "existing",
+    "findings_dir",
+    "findings_file",
+    "project_name",
+    "proposal",
+    "run_ledger",
+];
+
+/// Validate one `--params key=value` pair. Keys must not contain '=' (it
+/// would corrupt the pair shape) or line breaks; values must not contain
+/// line breaks (they would inject into YAML/instruction text). '=' IS
+/// allowed in values: goose splits each pair on the FIRST '=', so
+/// `url=http://x/?a=b` arrives intact (base64 blobs and embedded JSON
+/// likewise) — rejecting it broke legitimate params for no safety gain.
+fn validate_recipe_param(k: &str, v: &str) -> Result<()> {
+    if k.contains('=') || k.contains('\n') || k.contains('\r') {
+        bail!(
+            "unsafe recipe param key {k:?}: keys with '=' or line breaks cannot be passed via --params (use a file instead)"
+        );
+    }
+    if v.contains('\n') || v.contains('\r') {
+        bail!(
+            "unsafe recipe param value for {k:?}: values with line breaks cannot be passed via --params (use a file instead)"
+        );
+    }
+    Ok(())
+}
+
+/// Goose lists recipe params as `key: value` (optional indent) — but only
+/// for keys the harness actually passed (see [`RECIPE_PARAM_KEYS`]).
 fn is_recipe_param_line(t: &str) -> bool {
     let Some((key, _)) = t.split_once(':') else {
         return false;
     };
-    let key = key.trim();
-    !key.is_empty()
-        && key.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    RECIPE_PARAM_KEYS.contains(&key.trim())
 }
 
 /// Token/cost usage for one goose recipe run, parsed from the response
@@ -506,23 +543,7 @@ fn run_recipe_once(
         .arg("--output-format")
         .arg("json");
     for (k, v) in params {
-        // goose's --params splits on the FIRST '=' only, so a value
-        // containing '=' would be silently mis-split (e.g. a base64 blob,
-        // a URL with a query string, embedded JSON). Fail loud rather than
-        // corrupt the recipe substitution. Newlines and carriage returns —
-        // in keys OR values — are equally unsafe: they'd inject into the
-        // YAML/instruction text.
-        if k.contains('=')
-            || k.contains('\n')
-            || k.contains('\r')
-            || v.contains('=')
-            || v.contains('\n')
-            || v.contains('\r')
-        {
-            bail!(
-                "unsafe recipe param {k:?}: keys/values with '=' or line breaks cannot be passed via --params (use a file instead)"
-            );
-        }
+        validate_recipe_param(k, v)?;
         cmd.arg("--params").arg(format!("{k}={v}"));
     }
     if let Some(t) = max_turns {
@@ -823,16 +844,21 @@ fn last_components_object(text: &str) -> Option<Value> {
     let mut from = 0;
     while let Some(rel) = text[from..].find("\"components\"") {
         let key = from + rel;
-        let Some(brace) = text[..key].rfind('{') else {
-            from = key + 1;
-            continue;
-        };
-        if let Some(end) = match_brace(&text[brace..]) {
-            let slice = &text[brace..=brace + end];
-            if let Ok(v) = serde_json::from_str::<Value>(slice) {
-                if v.get("components").and_then(|c| c.as_array()).is_some() {
+        // The nearest preceding '{' may open a NESTED sibling (e.g. the
+        // `{"a": 1}` in `{"sibling": {"a": 1}, "components": [...]}`),
+        // whose slice parses but holds no components. Walk outward through
+        // earlier braces until one yields a components object — otherwise
+        // the real outer object is skipped and the answer is missed.
+        let mut search_end = key;
+        while let Some(brace) = text[..search_end].rfind('{') {
+            let parsed = match_brace(&text[brace..])
+                .and_then(|end| serde_json::from_str::<Value>(&text[brace..=brace + end]).ok());
+            match parsed {
+                Some(v) if v.get("components").and_then(|c| c.as_array()).is_some() => {
                     last = Some(v);
+                    break;
                 }
+                _ => search_end = brace,
             }
         }
         from = key + 1;
@@ -1085,6 +1111,29 @@ mod usage_tests {
     }
 
     #[test]
+    fn recipe_param_values_may_contain_equals() {
+        // `url=http://x/?a=b` splits on the FIRST '=' — the value arrives
+        // intact, so '=' in values must not be rejected.
+        assert!(validate_recipe_param("url", "http://x/?a=b").is_ok());
+        assert!(validate_recipe_param("blob", "aGVsbG8=").is_ok());
+        assert!(validate_recipe_param("k", "v").is_ok());
+        // '=' in keys corrupts the pair shape; line breaks inject.
+        assert!(validate_recipe_param("a=b", "v").is_err());
+        assert!(validate_recipe_param("k", "a\nb").is_err());
+        assert!(validate_recipe_param("k\r", "v").is_err());
+    }
+
+    #[test]
+    fn nested_sibling_before_components_still_parses() {
+        // The nearest '{' before `"components"` opens the nested sibling,
+        // which parses but holds no components — the search must walk out
+        // to the real object instead of missing the answer.
+        let text = r#"note {"sibling": {"a": 1}, "components": [{"slug": "x"}]} tail"#;
+        let v = last_components_object(text).expect("json");
+        assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn last_components_object_needs_a_components_array() {
         assert!(last_components_object("{\"slug\": \"a\"}").is_none());
         assert!(last_components_object("plain text").is_none());
@@ -1270,12 +1319,15 @@ Parameters used to load this recipe:\n";
 
     #[test]
     fn recipe_load_banner_with_params_is_dropped() {
+        // Fixture keys must be real harness params (project_name/existing
+        // are what discover actually passes) — anything else is warnings
+        // output and must be kept (see warning_like_lines_are_kept).
         let banner = "\
 Loading recipe: Discover components in eldr
 Description: Invent a component checklist for the repo, returned as JSON
 Parameters used to load this recipe:
-  project: eldr
-  existing_checklist: /tmp/x
+  project_name: eldr
+  existing: /tmp/x
 ";
         assert_eq!(leftover_goose_stderr(banner), "");
     }
@@ -1286,10 +1338,26 @@ Parameters used to load this recipe:
 Loading recipe: Discover components in eldr
 Description: Invent a component checklist
 Parameters used to load this recipe:
-project: eldr
-existing_checklist: /tmp/x
+project_name: eldr
+existing: /tmp/x
 ";
         assert_eq!(leftover_goose_stderr(banner), "");
+    }
+
+    #[test]
+    fn warning_like_lines_are_kept() {
+        // `warning:`/`error:` match the old snake_case heuristic but are
+        // NOT recipe params — stripping them hid real diagnostics.
+        let text = "Loading recipe: Fix findings in cli\n\
+Description: Fixes review findings in one repo component\n\
+Parameters used to load this recipe:\n\
+  component: cli\n\
+warning: unused credential\n\
+error: provider flake\n";
+        assert_eq!(
+            leftover_goose_stderr(text),
+            "warning: unused credential\nerror: provider flake"
+        );
     }
 
     #[test]

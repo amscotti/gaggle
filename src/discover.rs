@@ -100,18 +100,33 @@ pub fn validate(
             return Ok(original);
         }
     };
-    if payload.components.is_empty() {
-        eprintln!(
-            "  warning: discovery validate returned no components — keeping first-pass proposal"
-        );
-        return Ok(original);
-    }
     let ok = outcome
         .result
         .get("ok")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let components = normalize(payload.components)?;
+    Ok(apply_validated_payload(payload, ok, original))
+}
+
+/// Merge a validator reply onto the first-pass proposal. The validator is
+/// advisory: anything unusable (no components, or nothing that survives
+/// normalization) keeps the original proposal rather than erroring the run.
+fn apply_validated_payload(payload: DiscoveryPayload, ok: bool, original: Discovery) -> Discovery {
+    if payload.components.is_empty() {
+        eprintln!(
+            "  warning: discovery validate returned no components — keeping first-pass proposal"
+        );
+        return original;
+    }
+    let components = match normalize(payload.components) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "  warning: discovery validate returned no usable components ({e:#}) — keeping first-pass proposal"
+            );
+            return original;
+        }
+    };
     if ok {
         println!(
             "  discovery validate: ok ({} component(s))",
@@ -123,7 +138,7 @@ pub fn validate(
             components.len()
         );
     }
-    Ok(Discovery {
+    Discovery {
         verify: if payload.verify.is_empty() {
             original.verify
         } else {
@@ -135,7 +150,7 @@ pub fn validate(
             payload.final_verify
         },
         components,
-    })
+    }
 }
 
 #[derive(Debug)]
@@ -146,15 +161,20 @@ pub(crate) struct DiscoveryPayload {
 }
 
 fn string_cmds(v: Option<&serde_json::Value>) -> Vec<String> {
+    // Control characters (notably embedded newlines) are rejected, mirroring
+    // `collect_verify`: gate commands land in config files and shell
+    // invocations, where a newline would split or inject commands.
+    let clean = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty() && !s.chars().any(|c| c.is_control())).then(|| s.to_string())
+    };
     match v {
         None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+        Some(serde_json::Value::String(s)) => clean(s).into_iter().collect(),
         Some(serde_json::Value::Array(a)) => a
             .iter()
             .filter_map(|item| item.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            .filter_map(clean)
             .collect(),
         Some(other) => {
             eprintln!("  discover: ignoring non-array `{other}` for a command list");
@@ -405,7 +425,10 @@ pub fn valid_slug(slug: &str) -> bool {
 }
 
 fn normalize_slug(slug: &str, name: &str, paths: &[String]) -> String {
-    let s = slug.trim().to_lowercase().replace(['_', ' '], "-");
+    // Same character pipeline as the path-stem branch below: dots become
+    // hyphens too, so `foo.bar` normalizes to `foo-bar` instead of failing
+    // validation and silently deriving a different slug.
+    let s = slug.trim().to_lowercase().replace(['_', ' ', '.'], "-");
     let s = s
         .split('-')
         .filter(|p| !p.is_empty())
@@ -847,6 +870,66 @@ mod priority_tests {
         ))
         .unwrap();
         assert_eq!(collect_paths(&it), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn dotted_slug_normalizes_to_hyphens() {
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "foo.bar", "name": "N", "paths": ["src"], "tier": "high"}
+        ))
+        .unwrap();
+        let out = normalize(vec![it]).unwrap();
+        // Not silently replaced by path derivation — the slug is kept.
+        assert_eq!(out[0].slug, "foo-bar");
+    }
+
+    #[test]
+    fn gate_commands_reject_control_characters() {
+        let v = serde_json::json!({
+            "verify": ["cargo test\nrm -rf", "ok"],
+            "final_verify": "cargo\te2e",
+            "components": []
+        });
+        let p = parse_discovery_payload(&v).unwrap();
+        assert_eq!(p.verify, vec!["ok"]);
+        assert!(p.final_verify.is_empty());
+    }
+
+    #[test]
+    fn validated_payload_falls_back_on_unusable() {
+        let original = Discovery {
+            verify: vec!["orig".into()],
+            final_verify: vec![],
+            components: normalize(vec![
+                serde_json::from_value(serde_json::json!(
+                    {"slug": "a", "name": "A", "paths": ["src"], "tier": "high"}
+                ))
+                .unwrap(),
+            ])
+            .unwrap(),
+        };
+        // Empty validator reply keeps the proposal.
+        let empty = parse_discovery_payload(&serde_json::json!({"components": []})).unwrap();
+        let out = apply_validated_payload(empty, true, original.clone());
+        assert_eq!(out.components[0].slug, "a");
+        // All-invalid components keep the proposal instead of erroring.
+        let bad = parse_discovery_payload(&serde_json::json!({"components": [
+            {"slug": "!!!", "name": "", "paths": [], "tier": "high"}
+        ]}))
+        .unwrap();
+        let out = apply_validated_payload(bad, false, original.clone());
+        assert_eq!(out.components.len(), 1);
+        assert_eq!(out.components[0].slug, "a");
+        // A usable reply wins; empty gates inherit the original per key.
+        let good = parse_discovery_payload(&serde_json::json!({
+            "verify": ["new"],
+            "components": [{"slug": "b", "name": "B", "paths": ["src"], "tier": "high"}]
+        }))
+        .unwrap();
+        let out = apply_validated_payload(good, false, original);
+        assert_eq!(out.components[0].slug, "b");
+        assert_eq!(out.verify, vec!["new"]);
+        assert!(out.final_verify.is_empty());
     }
 
     #[test]
