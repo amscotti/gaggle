@@ -100,18 +100,33 @@ pub fn validate(
             return Ok(original);
         }
     };
-    if payload.components.is_empty() {
-        eprintln!(
-            "  warning: discovery validate returned no components — keeping first-pass proposal"
-        );
-        return Ok(original);
-    }
     let ok = outcome
         .result
         .get("ok")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let components = normalize(payload.components)?;
+    Ok(apply_validated_payload(payload, ok, original))
+}
+
+/// Merge a validator reply onto the first-pass proposal. The validator is
+/// advisory: anything unusable (no components, or nothing that survives
+/// normalization) keeps the original proposal rather than erroring the run.
+fn apply_validated_payload(payload: DiscoveryPayload, ok: bool, original: Discovery) -> Discovery {
+    if payload.components.is_empty() {
+        eprintln!(
+            "  warning: discovery validate returned no components — keeping first-pass proposal"
+        );
+        return original;
+    }
+    let components = match normalize(payload.components) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "  warning: discovery validate returned no usable components ({e:#}) — keeping first-pass proposal"
+            );
+            return original;
+        }
+    };
     if ok {
         println!(
             "  discovery validate: ok ({} component(s))",
@@ -123,7 +138,7 @@ pub fn validate(
             components.len()
         );
     }
-    Ok(Discovery {
+    Discovery {
         verify: if payload.verify.is_empty() {
             original.verify
         } else {
@@ -135,7 +150,7 @@ pub fn validate(
             payload.final_verify
         },
         components,
-    })
+    }
 }
 
 #[derive(Debug)]
@@ -146,15 +161,20 @@ pub(crate) struct DiscoveryPayload {
 }
 
 fn string_cmds(v: Option<&serde_json::Value>) -> Vec<String> {
+    // Control characters (notably embedded newlines) are rejected, mirroring
+    // `collect_verify`: gate commands land in config files and shell
+    // invocations, where a newline would split or inject commands.
+    let clean = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty() && !s.chars().any(|c| c.is_control())).then(|| s.to_string())
+    };
     match v {
         None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+        Some(serde_json::Value::String(s)) => clean(s).into_iter().collect(),
         Some(serde_json::Value::Array(a)) => a
             .iter()
             .filter_map(|item| item.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            .filter_map(clean)
             .collect(),
         Some(other) => {
             eprintln!("  discover: ignoring non-array `{other}` for a command list");
@@ -405,7 +425,10 @@ pub fn valid_slug(slug: &str) -> bool {
 }
 
 fn normalize_slug(slug: &str, name: &str, paths: &[String]) -> String {
-    let s = slug.trim().to_lowercase().replace(['_', ' '], "-");
+    // Same character pipeline as the path-stem branch below: dots become
+    // hyphens too, so `foo.bar` normalizes to `foo-bar` instead of failing
+    // validation and silently deriving a different slug.
+    let s = slug.trim().to_lowercase().replace(['_', ' ', '.'], "-");
     let s = s
         .split('-')
         .filter(|p| !p.is_empty())
@@ -656,6 +679,267 @@ mod priority_tests {
         let items = parse_discovery_payload(&v).unwrap();
         assert_eq!(items.components.len(), 2);
         assert!(items.verify.is_empty());
+    }
+
+    #[test]
+    fn write_proposal_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "gaggle-discover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let d = Discovery {
+            verify: vec!["cargo test".into()],
+            final_verify: vec!["cargo test --release".into()],
+            components: normalize(vec![
+                serde_json::from_value(serde_json::json!({
+                    "slug": "a", "name": "A", "tier": "high", "paths": ["src/a.rs"]
+                }))
+                .unwrap(),
+            ])
+            .unwrap(),
+        };
+        let p = dir.join("sub").join("proposal.json");
+        write_proposal(&p, &d).unwrap();
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(back["verify"], serde_json::json!(["cargo test"]));
+        assert_eq!(back["components"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_rejects_non_array_components_and_missing_key() {
+        let v = serde_json::json!({"components": {"slug": "a"}});
+        let err = parse_discovery_payload(&v).unwrap_err().to_string();
+        assert!(err.contains("must be an array"), "{err}");
+        let v = serde_json::json!({"verify": ["x"]});
+        let err = parse_discovery_payload(&v).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn parse_accepts_bare_array_and_string_gates() {
+        let v = serde_json::json!([
+            {"slug": "a", "name": "A", "paths": ["src"], "tier": "high"}
+        ]);
+        let p = parse_discovery_payload(&v).unwrap();
+        assert_eq!(p.components.len(), 1);
+        // Singular string gates and nulls degrade gracefully.
+        let v = serde_json::json!({
+            "verify": "cargo test",
+            "final_verify": null,
+            "components": []
+        });
+        let p = parse_discovery_payload(&v).unwrap();
+        assert_eq!(p.verify, vec!["cargo test"]);
+        assert!(p.final_verify.is_empty());
+        // A non-string/non-array gate is ignored, not fatal.
+        let v = serde_json::json!({
+            "verify": {"cmd": "x"},
+            "components": []
+        });
+        let p = parse_discovery_payload(&v).unwrap();
+        assert!(p.verify.is_empty());
+    }
+
+    #[test]
+    fn normalize_rejects_unusable_items_and_enforces_bounds() {
+        // Empty input fails the minimum-components bound.
+        assert!(normalize(vec![]).is_err());
+        // A bad slug with no paths and no name has nothing to derive
+        // from — zero usable items also fails the bound.
+        let bad: Vec<RawItem> = vec![
+            serde_json::from_value(serde_json::json!(
+                {"slug": "!!!", "name": "", "paths": [], "tier": "high"}
+            ))
+            .unwrap(),
+        ];
+        assert!(normalize(bad).is_err());
+        // A valid slug whose paths all escape is rejected the same way.
+        let escaped: Vec<RawItem> = vec![
+            serde_json::from_value(serde_json::json!(
+                {"slug": "ok", "name": "O", "paths": ["../escape"], "tier": "high"}
+            ))
+            .unwrap(),
+        ];
+        assert!(normalize(escaped).is_err());
+        // A garbage slug with usable paths DERIVES a slug from the path
+        // (lenient by design) and survives alongside the good item.
+        let items: Vec<RawItem> = vec![
+            serde_json::from_value(serde_json::json!(
+                {"slug": "!!!", "name": "", "paths": ["src/e.rs"], "tier": "high"}
+            ))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!(
+                {"slug": "good", "name": "", "paths": ["src/g.rs"], "tier": "high"}
+            ))
+            .unwrap(),
+        ];
+        let out = normalize(items).unwrap();
+        assert_eq!(out.len(), 2);
+        // Empty name falls back to the slug.
+        assert!(out.iter().all(|c| c.name == c.slug));
+    }
+
+    #[test]
+    fn normalize_truncates_to_highest_priority() {
+        let items: Vec<RawItem> = (1..=MAX_COMPONENTS + 5)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "slug": format!("c-{i:02}"), "name": "N",
+                    "paths": ["src/x.rs"], "tier": "low", "priority": i
+                }))
+                .unwrap()
+            })
+            .collect();
+        let out = normalize(items).unwrap();
+        assert_eq!(out.len(), MAX_COMPONENTS);
+        // Sorted by priority desc: the five lowest priorities were cut.
+        assert!(out[0].priority >= out[out.len() - 1].priority);
+        assert!(out.iter().all(|c| c.priority >= 6));
+        assert!(!out.iter().any(|c| c.slug == "c-01"));
+    }
+
+    #[test]
+    fn valid_slug_table() {
+        for good in ["a", "loop-engine", "x1", "a-b-c"] {
+            assert!(valid_slug(good), "{good}");
+        }
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "a--b",
+            "UPPER",
+            "with space",
+            "with/slash",
+            "with.dot",
+            "with_underscore",
+        ] {
+            assert!(!valid_slug(bad), "{bad}");
+        }
+        assert!(!valid_slug(&"a".repeat(65)), "over length limit");
+    }
+
+    #[test]
+    fn slug_derives_from_path_then_name() {
+        // Garbage slug falls back to the first path's stem.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "!!!", "name": "N", "paths": ["src/foo_bar.rs"], "tier": "high"}
+        ))
+        .unwrap();
+        let out = normalize(vec![it]).unwrap();
+        assert_eq!(out[0].slug, "foo-bar");
+        // Unusable path stem falls back to the name.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "!!!", "name": "My Comp", "paths": ["src/ok.rs"], "tier": "high"}
+        ))
+        .unwrap();
+        // "src/ok.rs" stem is usable ("ok"), so path wins over the name.
+        let out = normalize(vec![it]).unwrap();
+        assert_eq!(out[0].slug, "ok");
+        // Singular `path` alias is merged with `paths`.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "s", "name": "S", "paths": ["src/a.rs"], "path": "src/b.rs", "tier": "high"}
+        ))
+        .unwrap();
+        assert_eq!(collect_paths(&it), vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn de_paths_leniency() {
+        // Null and non-string shapes degrade to empty.
+        for v in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({"a": 1}),
+        ] {
+            let it: RawItem = serde_json::from_value(serde_json::json!(
+                {"slug": "a", "name": "A", "tier": "high", "paths": v}
+            ))
+            .unwrap();
+            assert!(collect_paths(&it).is_empty(), "{v}");
+        }
+        // Non-string array entries are dropped, strings kept.
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "a", "name": "A", "tier": "high", "paths": ["src/a.rs", 7]}
+        ))
+        .unwrap();
+        assert_eq!(collect_paths(&it), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn dotted_slug_normalizes_to_hyphens() {
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "foo.bar", "name": "N", "paths": ["src"], "tier": "high"}
+        ))
+        .unwrap();
+        let out = normalize(vec![it]).unwrap();
+        // Not silently replaced by path derivation — the slug is kept.
+        assert_eq!(out[0].slug, "foo-bar");
+    }
+
+    #[test]
+    fn gate_commands_reject_control_characters() {
+        let v = serde_json::json!({
+            "verify": ["cargo test\nrm -rf", "ok"],
+            "final_verify": "cargo\te2e",
+            "components": []
+        });
+        let p = parse_discovery_payload(&v).unwrap();
+        assert_eq!(p.verify, vec!["ok"]);
+        assert!(p.final_verify.is_empty());
+    }
+
+    #[test]
+    fn validated_payload_falls_back_on_unusable() {
+        let original = Discovery {
+            verify: vec!["orig".into()],
+            final_verify: vec![],
+            components: normalize(vec![
+                serde_json::from_value(serde_json::json!(
+                    {"slug": "a", "name": "A", "paths": ["src"], "tier": "high"}
+                ))
+                .unwrap(),
+            ])
+            .unwrap(),
+        };
+        // Empty validator reply keeps the proposal.
+        let empty = parse_discovery_payload(&serde_json::json!({"components": []})).unwrap();
+        let out = apply_validated_payload(empty, true, original.clone());
+        assert_eq!(out.components[0].slug, "a");
+        // All-invalid components keep the proposal instead of erroring.
+        let bad = parse_discovery_payload(&serde_json::json!({"components": [
+            {"slug": "!!!", "name": "", "paths": [], "tier": "high"}
+        ]}))
+        .unwrap();
+        let out = apply_validated_payload(bad, false, original.clone());
+        assert_eq!(out.components.len(), 1);
+        assert_eq!(out.components[0].slug, "a");
+        // A usable reply wins; empty gates inherit the original per key.
+        let good = parse_discovery_payload(&serde_json::json!({
+            "verify": ["new"],
+            "components": [{"slug": "b", "name": "B", "paths": ["src"], "tier": "high"}]
+        }))
+        .unwrap();
+        let out = apply_validated_payload(good, false, original);
+        assert_eq!(out.components[0].slug, "b");
+        assert_eq!(out.verify, vec!["new"]);
+        assert!(out.final_verify.is_empty());
+    }
+
+    #[test]
+    fn collect_verify_trims_dedupes_and_drops_control() {
+        let it: RawItem = serde_json::from_value(serde_json::json!(
+            {"slug": "a", "name": "A", "tier": "high", "paths": ["src"],
+             "verify": [" cargo test ", "", "cargo test", "bad\u{1}cmd"]}
+        ))
+        .unwrap();
+        assert_eq!(collect_verify(&it), vec!["cargo test"]);
     }
 
     #[test]

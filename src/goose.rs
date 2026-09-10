@@ -336,17 +336,54 @@ fn is_recipe_banner_continuation(line: &str) -> bool {
         || is_recipe_param_line(t)
 }
 
-/// Goose lists recipe params as `snake_case: value` (optional indent).
+/// Every `key=value` pair the harness passes to `goose run --params` (see the
+/// `params` arrays at the `run_recipe` call sites). The recipe-load banner
+/// echoes them back as `key: value` lines; only those lines are banner
+/// continuations. Anything else (`warning: …`, `error: …`, rust traces) is
+/// real stderr and must be surfaced, never stripped. If a new recipe param
+/// is added, add its key here too — otherwise its banner line leaks into
+/// the warnings output (noisy but harmless, and covered by test).
+const RECIPE_PARAM_KEYS: &[&str] = &[
+    "component",
+    "component_name",
+    "component_paths",
+    "components_file",
+    "diagnostics_file",
+    "existing",
+    "findings_dir",
+    "findings_file",
+    "project_name",
+    "proposal",
+    "run_ledger",
+];
+
+/// Validate one `--params key=value` pair. Keys must not contain '=' (it
+/// would corrupt the pair shape) or line breaks; values must not contain
+/// line breaks (they would inject into YAML/instruction text). '=' IS
+/// allowed in values: goose splits each pair on the FIRST '=', so
+/// `url=http://x/?a=b` arrives intact (base64 blobs and embedded JSON
+/// likewise) — rejecting it broke legitimate params for no safety gain.
+fn validate_recipe_param(k: &str, v: &str) -> Result<()> {
+    if k.contains('=') || k.contains('\n') || k.contains('\r') {
+        bail!(
+            "unsafe recipe param key {k:?}: keys with '=' or line breaks cannot be passed via --params (use a file instead)"
+        );
+    }
+    if v.contains('\n') || v.contains('\r') {
+        bail!(
+            "unsafe recipe param value for {k:?}: values with line breaks cannot be passed via --params (use a file instead)"
+        );
+    }
+    Ok(())
+}
+
+/// Goose lists recipe params as `key: value` (optional indent) — but only
+/// for keys the harness actually passed (see [`RECIPE_PARAM_KEYS`]).
 fn is_recipe_param_line(t: &str) -> bool {
     let Some((key, _)) = t.split_once(':') else {
         return false;
     };
-    let key = key.trim();
-    !key.is_empty()
-        && key.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    RECIPE_PARAM_KEYS.contains(&key.trim())
 }
 
 /// Token/cost usage for one goose recipe run, parsed from the response
@@ -506,23 +543,7 @@ fn run_recipe_once(
         .arg("--output-format")
         .arg("json");
     for (k, v) in params {
-        // goose's --params splits on the FIRST '=' only, so a value
-        // containing '=' would be silently mis-split (e.g. a base64 blob,
-        // a URL with a query string, embedded JSON). Fail loud rather than
-        // corrupt the recipe substitution. Newlines and carriage returns —
-        // in keys OR values — are equally unsafe: they'd inject into the
-        // YAML/instruction text.
-        if k.contains('=')
-            || k.contains('\n')
-            || k.contains('\r')
-            || v.contains('=')
-            || v.contains('\n')
-            || v.contains('\r')
-        {
-            bail!(
-                "unsafe recipe param {k:?}: keys/values with '=' or line breaks cannot be passed via --params (use a file instead)"
-            );
-        }
+        validate_recipe_param(k, v)?;
         cmd.arg("--params").arg(format!("{k}={v}"));
     }
     if let Some(t) = max_turns {
@@ -823,16 +844,21 @@ fn last_components_object(text: &str) -> Option<Value> {
     let mut from = 0;
     while let Some(rel) = text[from..].find("\"components\"") {
         let key = from + rel;
-        let Some(brace) = text[..key].rfind('{') else {
-            from = key + 1;
-            continue;
-        };
-        if let Some(end) = match_brace(&text[brace..]) {
-            let slice = &text[brace..=brace + end];
-            if let Ok(v) = serde_json::from_str::<Value>(slice) {
-                if v.get("components").and_then(|c| c.as_array()).is_some() {
+        // The nearest preceding '{' may open a NESTED sibling (e.g. the
+        // `{"a": 1}` in `{"sibling": {"a": 1}, "components": [...]}`),
+        // whose slice parses but holds no components. Walk outward through
+        // earlier braces until one yields a components object — otherwise
+        // the real outer object is skipped and the answer is missed.
+        let mut search_end = key;
+        while let Some(brace) = text[..search_end].rfind('{') {
+            let parsed = match_brace(&text[brace..])
+                .and_then(|end| serde_json::from_str::<Value>(&text[brace..=brace + end]).ok());
+            match parsed {
+                Some(v) if v.get("components").and_then(|c| c.as_array()).is_some() => {
                     last = Some(v);
+                    break;
                 }
+                _ => search_end = brace,
             }
         }
         from = key + 1;
@@ -1052,6 +1078,140 @@ mod usage_tests {
     }
 
     #[test]
+    fn extract_skips_non_assistant_and_non_text_blocks() {
+        let env = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "{\"nope\": 1}"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "text": "x"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "chatter, no json"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "done\n{\"outcome\": \"fixed\"}"}]},
+            ]
+        });
+        let v = extract_from_envelope(&env).expect("json");
+        assert_eq!(v.get("outcome").and_then(|o| o.as_str()), Some("fixed"));
+        // Nothing parseable anywhere → None (never invents a result).
+        let env = serde_json::json!({
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "just words"}]}]
+        });
+        assert!(extract_from_envelope(&env).is_none());
+        assert!(extract_from_envelope(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn scan_skips_inner_elements_and_falls_back_to_block() {
+        // A trailing inner array element is skipped, not returned as the
+        // answer; with the enclosing block broken, nothing parses → None.
+        let v =
+            scan_trailing_json("{\"components\": [oops\n{\"slug\": \"a\", \"paths\": [\"src\"]}");
+        assert!(v.is_none());
+        // Whole-block JSON that spans lines still parses.
+        let v = scan_trailing_json("{\n\"outcome\": \"fixed\"\n}").expect("json");
+        assert_eq!(v.get("outcome").and_then(|o| o.as_str()), Some("fixed"));
+        assert!(scan_trailing_json("no json at all").is_none());
+    }
+
+    #[test]
+    fn recipe_param_values_may_contain_equals() {
+        // `url=http://x/?a=b` splits on the FIRST '=' — the value arrives
+        // intact, so '=' in values must not be rejected.
+        assert!(validate_recipe_param("url", "http://x/?a=b").is_ok());
+        assert!(validate_recipe_param("blob", "aGVsbG8=").is_ok());
+        assert!(validate_recipe_param("k", "v").is_ok());
+        // '=' in keys corrupts the pair shape; line breaks inject.
+        assert!(validate_recipe_param("a=b", "v").is_err());
+        assert!(validate_recipe_param("k", "a\nb").is_err());
+        assert!(validate_recipe_param("k\r", "v").is_err());
+    }
+
+    #[test]
+    fn nested_sibling_before_components_still_parses() {
+        // The nearest '{' before `"components"` opens the nested sibling,
+        // which parses but holds no components — the search must walk out
+        // to the real object instead of missing the answer.
+        let text = r#"note {"sibling": {"a": 1}, "components": [{"slug": "x"}]} tail"#;
+        let v = last_components_object(text).expect("json");
+        assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn last_components_object_needs_a_components_array() {
+        assert!(last_components_object("{\"slug\": \"a\"}").is_none());
+        assert!(last_components_object("plain text").is_none());
+        // A `"components"` mention with no opening brace is skipped, and
+        // the later real object still wins.
+        let v = last_components_object(
+            "components was discussed\n{\"components\": [{\"slug\": \"a\"}]}",
+        )
+        .expect("json");
+        assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn field_reads_string_fields_only() {
+        let v = serde_json::json!({"a": "x", "n": 1});
+        assert_eq!(field(&v, "a"), Some("x"));
+        assert_eq!(field(&v, "missing"), None);
+        assert_eq!(field(&v, "n"), None);
+    }
+
+    #[test]
+    fn thinking_effort_pins_by_phase() {
+        use RecipePhase::*;
+        assert_eq!(Discover.thinking_effort(), ThinkingEffort::Low);
+        assert_eq!(Review.thinking_effort(), ThinkingEffort::Medium);
+        assert_eq!(Fix.thinking_effort(), ThinkingEffort::Medium);
+        assert_eq!(ThinkingEffort::High.as_str(), "high");
+    }
+
+    #[test]
+    fn goose_timeout_parses_seconds_and_zero_disables() {
+        let key = "GAGGLE_GOOSE_TIMEOUT_SECS";
+        let saved = std::env::var(key).ok();
+        // SAFETY: no other test in this binary touches this variable
+        // (it is only read by goose_run_timeout), so sequential
+        // mutation within this single test cannot race.
+        unsafe {
+            // Unset → no timeout (long agent runs are legitimate work).
+            std::env::remove_var(key);
+        }
+        assert_eq!(goose_run_timeout(), None);
+        unsafe {
+            std::env::set_var(key, "90");
+        }
+        assert_eq!(
+            goose_run_timeout(),
+            Some(std::time::Duration::from_secs(90))
+        );
+        // Explicit zero and garbage both mean no timeout (garbage warns).
+        unsafe {
+            std::env::set_var(key, "0");
+        }
+        assert_eq!(goose_run_timeout(), None);
+        unsafe {
+            std::env::set_var(key, "soon");
+        }
+        assert_eq!(goose_run_timeout(), None);
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn summary_reports_empty_and_cache_fields() {
+        assert_eq!(Usage::default().summary(), "(usage not reported)");
+        assert!(Usage::default().is_empty());
+        let u = Usage {
+            cache_read_input_tokens: Some(5),
+            ..Default::default()
+        };
+        assert!(!u.is_empty());
+        assert!(u.summary().contains("5 cache-read"), "{}", u.summary());
+    }
+
+    #[test]
     fn last_envelope_wins_over_earlier_one() {
         let two =
             format!("{{\"messages\":[],\"metadata\":{{\"total_tokens\":1}}}}\nbanner\n{ENVELOPE}");
@@ -1159,12 +1319,15 @@ Parameters used to load this recipe:\n";
 
     #[test]
     fn recipe_load_banner_with_params_is_dropped() {
+        // Fixture keys must be real harness params (project_name/existing
+        // are what discover actually passes) — anything else is warnings
+        // output and must be kept (see warning_like_lines_are_kept).
         let banner = "\
 Loading recipe: Discover components in eldr
 Description: Invent a component checklist for the repo, returned as JSON
 Parameters used to load this recipe:
-  project: eldr
-  existing_checklist: /tmp/x
+  project_name: eldr
+  existing: /tmp/x
 ";
         assert_eq!(leftover_goose_stderr(banner), "");
     }
@@ -1175,10 +1338,26 @@ Parameters used to load this recipe:
 Loading recipe: Discover components in eldr
 Description: Invent a component checklist
 Parameters used to load this recipe:
-project: eldr
-existing_checklist: /tmp/x
+project_name: eldr
+existing: /tmp/x
 ";
         assert_eq!(leftover_goose_stderr(banner), "");
+    }
+
+    #[test]
+    fn warning_like_lines_are_kept() {
+        // `warning:`/`error:` match the old snake_case heuristic but are
+        // NOT recipe params — stripping them hid real diagnostics.
+        let text = "Loading recipe: Fix findings in cli\n\
+Description: Fixes review findings in one repo component\n\
+Parameters used to load this recipe:\n\
+  component: cli\n\
+warning: unused credential\n\
+error: provider flake\n";
+        assert_eq!(
+            leftover_goose_stderr(text),
+            "warning: unused credential\nerror: provider flake"
+        );
     }
 
     #[test]

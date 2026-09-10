@@ -124,6 +124,7 @@ facts (components, commits, cost) computed by the harness, open questions
 | `gaggle history` | Past runs (outcome, cost, leftovers); `gaggle history <run-id>` replays a run's full report |
 | `gaggle requeue <slug>… \| --all` | Move quarantined components back to pending for retry (unchecking them in the checklist also requeues Done and Failed on the next run) |
 | `gaggle restart` | Same checklist and config, every component pending — for another full pass |
+| `gaggle refresh` | Rediscover components (KEEP/DROP/ADD); keeps `.review/` and progress on live slugs; rewrites `verify` / `final_verify` |
 | `gaggle model` | Print the effective agent model and where it comes from |
 
 All run state lives under `.review/` in the target repo. `gaggle init`
@@ -132,7 +133,16 @@ findings, logs, archives). Every finished run is archived under
 `.review/runs/<timestamp>/` (report, ledger, state snapshot, cost) for
 post-mortems: `gaggle history` summarizes them at a glance. `gaggle restart`
 unchecks the checklist and clears this run's findings so `gaggle run` does
-the whole pass again. Delete `.review/` if you want a fresh discovery.
+the whole pass again. `gaggle refresh` rediscovers the component list from
+the current tree without deleting `.review/` or wiping progress on slugs
+that still exist; it does rewrite `verify` / `final_verify` in
+`.review/config.toml`. Do not run `gaggle run` while refresh is discovering,
+and do not refresh while a run is alive — the two can overwrite each
+other. In the checklist, `[x]` means the component is not in the pending
+work queue (`Done` or Failed/quarantined); `[ ]` means pending or an
+operator-requested redo. `gaggle list` still shows the real phase.
+Uncheck a box or `gaggle requeue` to retry quarantine. Delete `.review/`
+only if you want a nuclear reset (config, recipes, and run history too).
 
 ## Configuration
 

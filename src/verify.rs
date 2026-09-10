@@ -642,8 +642,9 @@ fn run_shell(
                     kill = Some(VerifyKill::Timeout {
                         after: timeout.unwrap_or_default(),
                     });
+                    // kill_tree reaps (bounded, with SIGKILL escalation)
+                    // so OUR pipe ends close and the drain threads finish.
                     kill_tree(&mut child);
-                    let _ = child.wait(); // reap so OUR pipes close
                     status_success = false;
                     break;
                 }
@@ -669,7 +670,6 @@ fn run_shell(
                         idle: stall.unwrap_or_default(),
                     });
                     kill_tree(&mut child);
-                    let _ = child.wait();
                     status_success = false;
                     break;
                 }
@@ -711,25 +711,70 @@ fn run_shell(
     })
 }
 
-/// Kill the child and (on Unix) its whole process group so descendants
+/// Grace period for SIGTERM before escalating: long enough for a healthy
+/// tree to flush and exit, short enough that a hung gate stays bounded.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Wait up to `limit` for the child to exit, polling with `try_wait` (which
+/// reaps on success). Returns true when the child was reaped. Never blocks
+/// longer than `limit` — the gate must survive even an unkillable child.
+fn wait_bounded(child: &mut std::process::Child, limit: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if start.elapsed() >= limit {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Signal the child and (on Unix) its whole process group so descendants
 /// don't survive to hold pipes or CPU.
-fn kill_tree(child: &mut std::process::Child) {
+fn signal_tree(child: &mut std::process::Child, sig: &str) {
     #[cfg(not(windows))]
     {
         // process_group(0) made the child a group leader: pgid == pid.
         let pgid = child.id();
-        let kill = Command::new("kill")
-            .arg("-TERM")
+        let signaled = Command::new("kill")
+            .arg(sig)
             .arg(format!("-{pgid}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        if kill.map(|s| s.success()).unwrap_or(false) {
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if signaled {
             return;
         }
     }
+    #[cfg(windows)]
+    {
+        let _ = sig;
+    }
     let _ = child.kill();
+}
+
+/// Kill the process tree and reap it, never blocking the gate. SIGTERM
+/// first (lets healthy trees flush); on timeout escalate to SIGKILL so a
+/// TERM-ignoring command cannot deadlock `run_shell` in `child.wait()`.
+/// If the child still refuses to die (unkillable sleep), the gate moves on
+/// — the OS reaps it when this process exits.
+fn kill_tree(child: &mut std::process::Child) {
+    signal_tree(child, "-TERM");
+    if wait_bounded(child, KILL_GRACE) {
+        return;
+    }
+    eprintln!("  ⚠ verify command ignored SIGTERM — escalating to SIGKILL");
+    signal_tree(child, "-KILL");
+    let _ = child.kill();
+    wait_bounded(child, KILL_GRACE);
 }
 
 /// Sum CPU time of processes in `pgid`, in milliseconds. `None` when we
@@ -876,6 +921,126 @@ mod tests {
         let dir = temp_repo();
         assert!(load_commands(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_commands_rejects_corrupt_and_mistyped() {
+        let dir = temp_repo();
+        let cfg = dir.join(".review/config.toml");
+        std::fs::write(&cfg, "not toml [[[\n").unwrap();
+        assert!(load_commands(&dir).is_err());
+        // `verify` must be an array of strings.
+        std::fs::write(&cfg, "verify = \"cargo test\"\n").unwrap();
+        let err = load_commands(&dir).unwrap_err().to_string();
+        assert!(err.contains("must be an array"), "{err}");
+        std::fs::write(&cfg, "verify = [\"ok\", 42]\n").unwrap();
+        let err = load_commands(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("verify[1]") && err.contains("must be a string"),
+            "{err}"
+        );
+        // Whitespace-only entries are rejected, not silently skipped.
+        std::fs::write(&cfg, "verify = [\"   \"]\n").unwrap();
+        assert!(load_commands(&dir).is_err());
+        // Missing key is rejected for the required gate…
+        std::fs::write(&cfg, "final_verify = [\"x\"]\n").unwrap();
+        let err = load_commands(&dir).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+        // …but final_verify falls back to verify when unset.
+        std::fs::write(&cfg, "verify = [\"cargo test\"]\n").unwrap();
+        assert_eq!(load_final_commands(&dir).unwrap(), vec!["cargo test"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_nonempty_line_skips_blanks_and_markers() {
+        assert_eq!(last_nonempty_line("a\n\n[gaggle] note\nb\n"), Some("b"));
+        assert_eq!(last_nonempty_line("[gaggle] only\n  \n"), None);
+        assert_eq!(last_nonempty_line(""), None);
+    }
+
+    #[test]
+    fn kill_markers_name_command_and_cause() {
+        assert!(
+            VerifyKill::Stall {
+                idle: std::time::Duration::from_secs(7)
+            }
+            .is_stall()
+        );
+        assert!(
+            !VerifyKill::Timeout {
+                after: std::time::Duration::from_secs(7)
+            }
+            .is_stall()
+        );
+        let mut out = String::new();
+        note_kill(
+            &mut out,
+            "slow.sh",
+            &VerifyKill::Stall {
+                idle: std::time::Duration::from_secs(7),
+            },
+            Some("last words"),
+        );
+        assert!(
+            out.contains("slow.sh") && out.contains("last words"),
+            "{out}"
+        );
+        let mut out = String::new();
+        note_kill(
+            &mut out,
+            "slow.sh",
+            &VerifyKill::Timeout {
+                after: std::time::Duration::from_secs(9),
+            },
+            None,
+        );
+        assert!(out.contains("slow.sh") && out.contains('9'), "{out}");
+    }
+
+    #[test]
+    fn resolve_timeout_env_wins_and_garbage_falls_back() {
+        use std::time::Duration;
+        // Invalid env is ignored so a typo does not skip a repo setting.
+        assert_eq!(
+            resolve_verify_timeout(Some("soon"), Some(5)),
+            Some(Duration::from_secs(5))
+        );
+        // Explicit zero disables even when config sets a timeout.
+        assert_eq!(resolve_verify_timeout(Some("0"), Some(5)), None);
+        assert_eq!(
+            resolve_verify_timeout(Some("30"), Some(5)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(resolve_verify_timeout(None, None), None);
+    }
+
+    #[test]
+    fn resolve_stall_zero_disables_and_invalid_falls_back() {
+        use std::time::Duration;
+        assert_eq!(resolve_verify_stall(Some("0"), Some(60)), None);
+        assert_eq!(
+            resolve_verify_stall(Some("30"), None),
+            Some(Duration::from_secs(30))
+        );
+        // Invalid env falls back to config; absent config → 15m default.
+        assert_eq!(
+            resolve_verify_stall(Some("soon"), Some(60)),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(resolve_verify_stall(None, None), Some(DEFAULT_STALL));
+        assert_eq!(resolve_verify_stall(None, Some(0)), None);
+    }
+
+    #[test]
+    fn append_output_joins_streams_with_newlines() {
+        let mut buf = String::new();
+        append_output(&mut buf, b"out", b"err\n");
+        assert_eq!(buf, "out\nerr\n");
+        // Lossy conversion never fails on hostile bytes.
+        let mut buf = String::new();
+        append_output(&mut buf, &[0xff, 0xfe], b"");
+        assert!(buf.ends_with('\n'));
     }
 
     #[test]
@@ -1086,6 +1251,36 @@ mod timeout_tests {
             !result.output.contains("timed out"),
             "must not kill when timeout is unset: {}",
             result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn term_ignoring_command_is_sigkilled_not_deadlocked() {
+        // `trap '' TERM` makes the shell ignore SIGTERM: the old
+        // kill-then-unbounded-wait deadlocked here until `sleep` exited
+        // on its own (~31s). SIGKILL escalation must bound the kill.
+        let dir = temp_repo();
+        let start = std::time::Instant::now();
+        let result = run_commands_timed(
+            &dir,
+            &["trap '' TERM; sleep 30".to_string()],
+            Some(Duration::from_secs(1)),
+            None,
+            false,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(!result.passed);
+        assert!(
+            matches!(result.kill, Some(VerifyKill::Timeout { .. })),
+            "expected a timeout kill, got {:?}",
+            result.kill
+        );
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "kill was not bounded — took {elapsed:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

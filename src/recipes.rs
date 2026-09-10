@@ -313,6 +313,51 @@ mod tests {
     }
 
     #[test]
+    fn apply_discovered_gates_leaves_model_commit_and_stall_keys() {
+        let repo = temp_repo();
+        fs::create_dir_all(repo.join(".review")).unwrap();
+        fs::write(
+            repo.join(".review/config.toml"),
+            "verify = [\"false\"]\n\
+             final_verify = [\"false\"]\n\
+             verify_stall_secs = 900\n\
+             [model]\n\
+             provider = \"openai\"\n\
+             model = \"gpt-5.6\"\n\
+             [commit]\n\
+             sign = false\n\
+             [branch]\n\
+             dedicated = true\n",
+        )
+        .unwrap();
+        apply_discovered_gates(
+            &repo,
+            &["./scripts/check.sh".to_string()],
+            &["./scripts/e2e.sh".to_string()],
+        )
+        .unwrap();
+        let cfg = fs::read_to_string(repo.join(".review/config.toml")).unwrap();
+        assert!(
+            cfg.lines()
+                .any(|l| l == "verify = [\"./scripts/check.sh\"]"),
+            "{cfg}"
+        );
+        assert!(
+            cfg.lines()
+                .any(|l| l == "final_verify = [\"./scripts/e2e.sh\"]"),
+            "{cfg}"
+        );
+        assert!(cfg.contains("verify_stall_secs = 900"), "{cfg}");
+        assert!(cfg.contains("[model]"), "{cfg}");
+        assert!(cfg.contains("provider = \"openai\""), "{cfg}");
+        assert!(cfg.contains("[commit]"), "{cfg}");
+        assert!(cfg.contains("sign = false"), "{cfg}");
+        assert!(cfg.contains("[branch]"), "{cfg}");
+        assert!(cfg.contains("dedicated = true"), "{cfg}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn apply_discovered_gates_writes_both_keys() {
         let repo = temp_repo();
         fs::create_dir_all(repo.join(".review")).unwrap();
@@ -334,6 +379,70 @@ mod tests {
             "{cfg}"
         );
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn ensure_config_creates_but_never_overwrites() {
+        let repo = temp_repo();
+        ensure_config(&repo).unwrap();
+        let cfg = repo.join(".review/config.toml");
+        assert!(cfg.exists());
+        fs::write(&cfg, "verify = [\"mine\"]\n").unwrap();
+        ensure_config(&repo).unwrap();
+        assert!(fs::read_to_string(&cfg).unwrap().contains("mine"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn apply_discovered_gates_empty_verify_warns_and_keeps_file() {
+        let repo = temp_repo();
+        fs::create_dir_all(repo.join(".review")).unwrap();
+        fs::write(repo.join(".review/config.toml"), "verify = [\"false\"]\n").unwrap();
+        apply_discovered_gates(&repo, &[], &[]).unwrap();
+        // Placeholder left alone when discovery named nothing.
+        assert!(
+            fs::read_to_string(repo.join(".review/config.toml"))
+                .unwrap()
+                .contains("verify = [\"false\"]")
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn apply_discovered_gates_appends_missing_keys() {
+        let repo = temp_repo();
+        fs::create_dir_all(repo.join(".review")).unwrap();
+        fs::write(repo.join(".review/config.toml"), "[model]\n").unwrap();
+        apply_discovered_gates(&repo, &["make check".to_string()], &[]).unwrap();
+        let cfg = fs::read_to_string(repo.join(".review/config.toml")).unwrap();
+        assert!(
+            cfg.lines().any(|l| l == "verify = [\"make check\"]"),
+            "{cfg}"
+        );
+        assert!(
+            cfg.lines().any(|l| l == "final_verify = [\"make check\"]"),
+            "{cfg}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn gitignore_handles_missing_file_and_no_trailing_newline() {
+        let repo = temp_repo();
+        ensure_gitignore(&repo).unwrap();
+        assert!(
+            fs::read_to_string(repo.join(".gitignore"))
+                .unwrap()
+                .contains(GITIGNORE_MARK)
+        );
+        let repo2 = temp_repo();
+        fs::write(repo2.join(".gitignore"), "/target").unwrap();
+        ensure_gitignore(&repo2).unwrap();
+        let text = fs::read_to_string(repo2.join(".gitignore")).unwrap();
+        assert!(text.contains("/target\n"), "{text:?}");
+        assert!(text.contains(GITIGNORE_MARK));
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&repo2);
     }
 
     #[test]

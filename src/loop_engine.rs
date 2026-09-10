@@ -10,11 +10,12 @@ use crate::commit;
 use crate::discover;
 use crate::goose::{self, field};
 use crate::recipes;
-use crate::state::{self, Phase, State};
+use crate::state::{self, ComponentState, Phase, State};
 use crate::status::{self, Phase as StatusPhase};
 use crate::verify;
 use anyhow::{Result, bail};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// How many review→fix cycles before a component is quarantined.
@@ -60,6 +61,15 @@ impl Engine {
         self.review_dir.join("state.json")
     }
 
+    /// Best-effort phase telemetry: a failed status write (disk full,
+    /// permissions, transient lock) must never abort a run that is
+    /// otherwise healthy. Failures warn; the run continues.
+    fn report_status(&self, phase: StatusPhase, component: &str, detail: &str) {
+        if let Err(e) = status::report(&self.review_dir, phase, component, detail) {
+            eprintln!("  ⚠ status telemetry failed (continuing): {e:#}");
+        }
+    }
+
     /// Review-only pass: review EVERY checklist component and record
     /// findings files, but never fix, verify, or commit. The on-disk state
     /// machine is untouched (a later `gaggle run` proceeds normally);
@@ -96,24 +106,18 @@ impl Engine {
             (checklist::tier_rank(&a.tier), &a.slug).cmp(&(checklist::tier_rank(&b.tier), &b.slug))
         });
 
-        status::report(
-            &self.review_dir,
+        self.report_status(
             StatusPhase::Picking,
             "-",
             &format!("review-only pass started ({} components)", ordered.len()),
-        )?;
+        );
 
         let mut total_findings = 0usize;
         let mut clean = 0usize;
         let mut errors = 0usize;
         for comp in &ordered {
             println!("\n=== {} — {} (review only) ===", comp.slug, comp.name);
-            status::report(
-                &self.review_dir,
-                StatusPhase::Reviewing,
-                &comp.slug,
-                "review agent starting",
-            )?;
+            self.report_status(StatusPhase::Reviewing, &comp.slug, "review agent starting");
             match self.review_component(&scratch, &comp.slug) {
                 Ok(findings) => {
                     println!("  review: {} finding(s)", findings.len());
@@ -153,15 +157,14 @@ impl Engine {
             }
         }
 
-        status::report(
-            &self.review_dir,
+        self.report_status(
             StatusPhase::Idle,
             "-",
             &format!(
                 "review-only pass complete: {} finding(s), {} clean, {} error(s)",
                 total_findings, clean, errors
             ),
-        )?;
+        );
         println!(
             "\nreview-only pass complete: {} component(s) — {} finding(s), {} clean, {} error(s)",
             ordered.len(),
@@ -255,7 +258,7 @@ impl Engine {
         // an existing gaggle/run-* branch is reused, not forked.
         *self.run_branch.borrow_mut() = commit::ensure_run_branch(&self.repo)?;
 
-        status::report(&self.review_dir, StatusPhase::Picking, "-", "loop started")?;
+        self.report_status(StatusPhase::Picking, "-", "loop started");
 
         while let Some(next) = state.next().cloned() {
             let comp = Component::new(&next.slug, &next.name, &next.tier);
@@ -282,8 +285,7 @@ impl Engine {
             .map(|c| c.slug.as_str())
             .collect();
         if !final_gate.passed {
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Failed,
                 "-",
                 &format!(
@@ -295,27 +297,25 @@ impl Engine {
                     },
                     final_gate.failed_command.clone().unwrap_or_default()
                 ),
-            )?;
+            );
         } else if !quarantined.is_empty() {
             // Gate is green; leftover quarantine is leftover work, not a
             // failed run. `gaggle status` used to show Failed here and
             // look like the suite never passed.
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Done,
                 "-",
                 &format!(
                     "final verify green; quarantined (requeue to retry): {}",
                     quarantined.join(", ")
                 ),
-            )?;
+            );
         } else {
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Done,
                 "-",
                 "all components done, final verify green",
-            )?;
+            );
         }
         if let Err(e) = self.generate_report(&state, &final_gate) {
             eprintln!("  warning: final report generation failed: {e:#}");
@@ -469,7 +469,7 @@ impl Engine {
     /// the cycle budget (or a persistent environmental failure) leaves
     /// the gate red for the caller to fail the process.
     fn close_final_gate(&self, state: &mut State) -> Result<verify::RunResult> {
-        let mut gate = self.run_final_verify();
+        let gate = self.run_final_verify();
         if gate.passed {
             return Ok(gate);
         }
@@ -479,7 +479,39 @@ impl Engine {
             .keys()
             .map(|slug| (slug.clone(), read_optional(&self.findings_path(slug))))
             .collect();
+        let result = self.run_gate_fix_loop(state, gate);
+        // Every exit restores the pre-gate findings files: each fix cycle
+        // overwrites the touched component's file with SYNTHETIC gate
+        // content, and a findings file's presence means unresolved
+        // component findings. Restoring only on commit left the synthetic
+        // file behind on fix-error, tamper, budget-exhausted, and
+        // commit-failure exits.
+        self.restore_findings_snapshots(&originals);
+        let gate = result?;
+        if !gate.passed {
+            commit::reset_worktree(&self.repo)?;
+        }
+        Ok(gate)
+    }
 
+    /// Restore pre-gate findings-file snapshots (see [`Engine::close_final_gate`]).
+    fn restore_findings_snapshots(
+        &self,
+        originals: &std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for (slug, prior) in originals {
+            restore_optional(&self.findings_path(slug), prior.as_deref());
+        }
+    }
+
+    /// Fix-and-retry loop for a red full-suite gate (extracted so
+    /// [`Engine::close_final_gate`] can restore findings snapshots on every
+    /// exit, including early `return`s below).
+    fn run_gate_fix_loop(
+        &self,
+        state: &mut State,
+        mut gate: verify::RunResult,
+    ) -> Result<verify::RunResult> {
         let mut cycles = 0usize;
         let mut env_retries = 0usize;
         while !gate.passed && cycles < MAX_FIX_CYCLES {
@@ -508,12 +540,11 @@ impl Engine {
             println!("\n=== full-gate fix {cycles}/{MAX_FIX_CYCLES} ===");
 
             let slug = classified.component.clone();
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Fixing,
                 &slug,
                 &format!("full-gate fix {cycles}/{MAX_FIX_CYCLES} — {slug}"),
-            )?;
+            );
             let finding = gate_finding(&gate, &classified.diagnostics);
             let outcome = match self.fix_component(state, &slug, &[finding]) {
                 Ok(o) => o,
@@ -538,12 +569,11 @@ impl Engine {
                 continue;
             }
 
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Verifying,
                 &slug,
                 "re-running full-suite verify after gate fix",
-            )?;
+            );
             gate = self.run_final_verify();
             if !gate.passed {
                 continue;
@@ -553,10 +583,6 @@ impl Engine {
             match commit::commit_dirty(&self.repo, &msg) {
                 Ok(h) if !h.is_empty() => {
                     println!("  commit: {h}");
-                    restore_optional(
-                        &self.findings_path(&slug),
-                        originals.get(&slug).and_then(|o| o.as_deref()),
-                    );
                     if let Some(c) = state.components.get_mut(&slug) {
                         c.commit = Some(h.clone());
                         c.detail = format!("fixed full-suite verify {h}");
@@ -565,10 +591,6 @@ impl Engine {
                 }
                 Ok(_) => {
                     println!("  commit: nothing new (tree already matches HEAD)");
-                    restore_optional(
-                        &self.findings_path(&slug),
-                        originals.get(&slug).and_then(|o| o.as_deref()),
-                    );
                 }
                 Err(e) => {
                     eprintln!("  commit FAILED after green full gate: {e:#}");
@@ -577,9 +599,6 @@ impl Engine {
             }
         }
 
-        if !gate.passed {
-            commit::reset_worktree(&self.repo)?;
-        }
         Ok(gate)
     }
 
@@ -859,12 +878,7 @@ impl Engine {
 
         state::transition(state, &slug, Phase::Reviewing)?;
         state.save(&self.state_path())?;
-        status::report(
-            &self.review_dir,
-            StatusPhase::Reviewing,
-            &slug,
-            "review agent starting",
-        )?;
+        self.report_status(StatusPhase::Reviewing, &slug, "review agent starting");
 
         // Goose dying is a retry, not a quarantine. Only after the
         // attempt budget is spent do we park this component and move on.
@@ -884,12 +898,11 @@ impl Engine {
                     eprintln!(
                         "  review attempt {attempt}/{MAX_FIX_CYCLES} failed: {review_err} — retrying"
                     );
-                    status::report(
-                        &self.review_dir,
+                    self.report_status(
                         StatusPhase::Reviewing,
                         &slug,
                         &format!("review agent failed ({attempt}/{MAX_FIX_CYCLES}) — retrying"),
-                    )?;
+                    );
                 }
             }
         }
@@ -914,7 +927,7 @@ impl Engine {
             }
             state::transition(state, &slug, Phase::Done)?;
             state.set_detail(&slug, "clean review — no findings")?;
-            status::report(&self.review_dir, StatusPhase::Done, &slug, "no findings")?;
+            self.report_status(StatusPhase::Done, &slug, "no findings");
             return Ok(());
         }
 
@@ -931,8 +944,7 @@ impl Engine {
                 state::transition(state, &slug, Phase::Fixing)?;
             }
             state.save(&self.state_path())?;
-            status::report(
-                &self.review_dir,
+            self.report_status(
                 StatusPhase::Fixing,
                 &slug,
                 &format!(
@@ -940,7 +952,7 @@ impl Engine {
                     MAX_FIX_CYCLES,
                     findings.len()
                 ),
-            )?;
+            );
 
             let work_order = findings.clone();
             // Goose flake/kill: spend this cycle, keep the work order,
@@ -959,12 +971,7 @@ impl Engine {
 
             state::transition(state, &slug, Phase::Verifying)?;
             state.save(&self.state_path())?;
-            status::report(
-                &self.review_dir,
-                StatusPhase::Verifying,
-                &slug,
-                "verify commands running",
-            )?;
+            self.report_status(StatusPhase::Verifying, &slug, "verify commands running");
 
             let v = self.verify_until_stable(state, &slug)?;
             if v.passed {
@@ -1000,12 +1007,11 @@ impl Engine {
                         return self.quarantine(state, &slug, &why);
                     }
                 }
-                status::report(
-                    &self.review_dir,
+                self.report_status(
                     StatusPhase::Reviewing,
                     &slug,
                     "confirming work-order findings",
-                )?;
+                );
                 // A confirm recipe flake must not close the work order.
                 // The commit already landed — treat findings as still
                 // open so the next cycle retries rather than claiming
@@ -1114,7 +1120,7 @@ impl Engine {
         }
         state::transition(state, slug, Phase::Committing)?;
         state::transition(state, slug, Phase::Done)?;
-        status::report(&self.review_dir, StatusPhase::Done, slug, &detail)?;
+        self.report_status(StatusPhase::Done, slug, &detail);
         println!("  ✓ {slug}: {detail}");
         Ok(())
     }
@@ -1138,7 +1144,7 @@ impl Engine {
         commit::reset_worktree(&self.repo)?;
         state.set_detail(slug, why)?;
         state::transition(state, slug, Phase::Failed)?;
-        status::report(&self.review_dir, StatusPhase::Failed, slug, why)?;
+        self.report_status(StatusPhase::Failed, slug, why);
         println!("  ✗ {slug}: {why}");
         Ok(())
     }
@@ -1252,24 +1258,7 @@ impl Engine {
     }
 
     fn findings_path(&self, slug: &str) -> PathBuf {
-        // Defense in depth: slugs are validated at parse/init, but a
-        // hand-edited state.json must still not escape `.review/findings/`.
-        let safe: String = slug
-            .chars()
-            .map(|c| {
-                if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let safe = if safe.is_empty() {
-            "unknown"
-        } else {
-            safe.as_str()
-        };
-        self.review_dir.join("findings").join(format!("{safe}.txt"))
+        findings_path(&self.review_dir, slug)
     }
 
     /// Retry an environmental / stall failure once. Still red after that
@@ -1656,6 +1645,12 @@ fn parse_findings(result: &Value) -> Result<Vec<String>> {
 /// Confirmation result. Missing/malformed `still_open` is treated as empty
 /// so a green verify is not reopened by a bad confirm payload.
 fn parse_still_open(result: &Value) -> Result<Vec<String>> {
+    // The confirm recipe contract ends every answer with
+    // `{"still_open": [...]}` (empty array = work order closed). A missing
+    // or misshapen key is a malformed answer, NOT a closed work order: the
+    // caller treats Err as "keep everything open", while Ok(empty) commits
+    // to done. Collapsing malformed into empty silently closed committed
+    // work the agent never confirmed.
     match result.get("still_open") {
         Some(Value::Array(items)) => {
             let mut out = Vec::new();
@@ -1668,11 +1663,20 @@ fn parse_still_open(result: &Value) -> Result<Vec<String>> {
             Ok(out)
         }
         Some(Value::String(s)) if !s.trim().is_empty() => Ok(vec![s.trim().to_string()]),
-        None | Some(Value::Null) | Some(Value::String(_)) => Ok(Vec::new()),
-        Some(other) => {
-            eprintln!("  confirm: unexpected still_open shape ({other}), treating as empty");
-            Ok(Vec::new())
+        missing => {
+            bail!(
+                "confirm answer has no usable `still_open` array (got {missing:?}) — keeping the work order open"
+            )
         }
+    }
+}
+
+/// Best-effort phase telemetry for free-function ops (init / refresh /
+/// requeue / restart): warn instead of failing the op on a status-write
+/// error. Method paths use `Engine::report_status`.
+fn report_status(review_dir: &Path, phase: StatusPhase, component: &str, detail: &str) {
+    if let Err(e) = status::report(review_dir, phase, component, detail) {
+        eprintln!("  ⚠ status telemetry failed (continuing): {e:#}");
     }
 }
 
@@ -1708,20 +1712,44 @@ pub fn init(
         warn_missing_paths(repo, &list);
         checklist::save(&review.join("checklist.md"), &list)?;
         state.save(&review.join("state.json"))?;
-        status::report(
+        report_status(
             &review,
             StatusPhase::Idle,
             "-",
             "initialized (explicit components)",
-        )?;
+        );
         return Ok(Vec::new());
     }
 
+    let discovered = run_ai_discovery(repo)?;
+    let list = components_from_discovery(&discovered);
+    warn_missing_paths(repo, &list);
+    checklist::save(&review.join("checklist.md"), &list)?;
+    let mut state = State::default();
+    state.sync(&list);
+    state.save(&review.join("state.json"))?;
+    report_status(
+        &review,
+        StatusPhase::Idle,
+        "-",
+        "initialized (ai-discovery)",
+    );
+    Ok(discovered.components)
+}
+
+/// AI discover → validate → apply_discovered_gates.
+///
+/// Caller must ensure `.review/` exists (`init` does `create_dir_all` first;
+/// `refresh` already has a checklist there). Writes
+/// `.review/existing-checklist.md` and `.review/discovery-proposal.json`.
+/// Does not write checklist.md or state.json. Does not scaffold gitignore.
+fn run_ai_discovery(repo: &Path) -> Result<discover::Discovery> {
     println!("AI component discovery…");
     let project = repo
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
+    let review = repo.join(crate::REVIEW_DIR);
     let existing_path = review.join("existing-checklist.md");
     let existing_text = load_existing_slugs(repo).unwrap_or_else(|| {
         "No existing checklist. Invent fresh slugs for every component.".to_string()
@@ -1740,9 +1768,11 @@ pub fn init(
             c.slug, c.tier, c.priority, c.name
         );
     }
+    Ok(discovered)
+}
 
-    let list: Vec<Component> = discovered
-        .components
+fn components_from_discovery(d: &discover::Discovery) -> Vec<Component> {
+    d.components
         .iter()
         .map(|c| {
             let mut comp = Component::new(&c.slug, &c.name, &c.tier);
@@ -1750,19 +1780,7 @@ pub fn init(
             comp.verify = c.verify.clone();
             comp
         })
-        .collect();
-    warn_missing_paths(repo, &list);
-    checklist::save(&review.join("checklist.md"), &list)?;
-    let mut state = State::default();
-    state.sync(&list);
-    state.save(&review.join("state.json"))?;
-    status::report(
-        &review,
-        StatusPhase::Idle,
-        "-",
-        "initialized (ai-discovery)",
-    )?;
-    Ok(discovered.components)
+        .collect()
 }
 
 fn checklist_from_state(state: &State, list: &[Component]) -> Vec<Component> {
@@ -1803,28 +1821,32 @@ fn load_existing_slugs(repo: &Path) -> Option<String> {
         let extra = state
             .as_ref()
             .and_then(|s| s.get(&c.slug))
-            .map(|st| {
-                let paths = if st.paths.is_empty() {
-                    c.paths.join(", ")
-                } else {
-                    st.paths.join(", ")
-                };
-                if paths.is_empty() {
-                    String::new()
-                } else {
-                    format!("  paths: {paths}")
-                }
-            })
-            .unwrap_or_else(|| {
-                if c.paths.is_empty() {
-                    String::new()
-                } else {
-                    format!("  paths: {}", c.paths.join(", "))
-                }
-            });
+            .map(|st| existing_slug_hint(c, Some(st)))
+            .unwrap_or_else(|| existing_slug_hint(c, None));
         out.push(format!("- {} — {} [{}]{}", c.slug, c.name, c.tier, extra));
     }
     Some(out.join("\n"))
+}
+
+fn existing_slug_hint(c: &Component, st: Option<&ComponentState>) -> String {
+    let paths = match st {
+        Some(st) if !st.paths.is_empty() => st.paths.join(", "),
+        _ => c.paths.join(", "),
+    };
+    let verify = match st {
+        Some(st) if !st.verify.is_empty() => st.verify.as_slice(),
+        _ => c.verify.as_slice(),
+    };
+    let mut extra = String::new();
+    if !paths.is_empty() {
+        extra.push_str("  paths: ");
+        extra.push_str(&paths);
+    }
+    for cmd in verify {
+        extra.push_str("  verify: ");
+        extra.push_str(cmd);
+    }
+    extra
 }
 
 /// Print a component table (CLI `gaggle list`).
@@ -1876,6 +1898,12 @@ pub fn history(repo: &Path, ts: Option<&str>) -> Result<()> {
 
     match ts {
         Some(ts) => {
+            // Allowlist against the listed archive names: a raw
+            // `runs_dir.join(ts)` would let `../` or an absolute path
+            // escape `.review/runs/` and read an arbitrary final-report.md.
+            if !entries.iter().any(|e| e == ts) {
+                bail!("no archived run named {ts:?} — try `gaggle history` for the list");
+            }
             let dir = runs_dir.join(ts);
             if !dir.is_dir() {
                 bail!("no archived run named {ts:?} — try `gaggle history` for the list");
@@ -1928,15 +1956,17 @@ pub fn history(repo: &Path, ts: Option<&str>) -> Result<()> {
     }
 }
 
-/// Write checklist.md from current state: checkbox = phase Done, paths
-/// refreshed from state. Shared by the engine loop and `requeue` so the
-/// file always mirrors the state machine after a mutation.
+/// Write checklist.md from current state.
+/// `[x]` = not in the pending work queue (phase Done **or** Failed).
+/// `[ ]` = pending, or an operator-requested redo.
+/// `gaggle list` still shows the real phase. Shared by the engine loop,
+/// `requeue`, and `restart`.
 fn persist_checklist(review_dir: &Path, state: &State) -> Result<()> {
     let path = review_dir.join("checklist.md");
     let mut comps = checklist::load(&path)?;
     for c in &mut comps {
         if let Some(st) = state.get(&c.slug) {
-            c.done = st.phase == Phase::Done;
+            c.done = matches!(st.phase, Phase::Done | Phase::Failed);
             if !st.paths.is_empty() {
                 c.paths = st.paths.clone();
             }
@@ -1944,6 +1974,27 @@ fn persist_checklist(review_dir: &Path, state: &State) -> Result<()> {
         }
     }
     checklist::save(&path, &comps)
+}
+
+/// Defense in depth: slugs are validated at parse/init, but a
+/// hand-edited state.json must still not escape `.review/findings/`.
+pub(crate) fn findings_path(review_dir: &Path, slug: &str) -> PathBuf {
+    let safe: String = slug
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "unknown"
+    } else {
+        safe.as_str()
+    };
+    review_dir.join("findings").join(format!("{safe}.txt"))
 }
 
 /// Requeue quarantined (Failed) components back to Pending so the next
@@ -1981,7 +2032,8 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
         return Ok(Vec::new());
     }
 
-    let mut requeued = Vec::new();
+    // Validate every target BEFORE mutating: a bad slug must fail the whole
+    // op with nothing half-applied (and nothing falsely reported).
     for slug in &targets {
         let phase = state
             .get(slug)
@@ -1994,6 +2046,10 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
                 phase.as_str()
             );
         }
+    }
+
+    let mut requeued = Vec::new();
+    for slug in &targets {
         state::transition(&mut state, slug, Phase::Pending)?;
         let prior = state
             .get(slug)
@@ -2001,13 +2057,16 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
             .unwrap_or_default();
         state.set_detail(slug, &format!("requeued (previously: {})", prior.trim()))?;
         state.set_open(slug, 0)?;
+        // Persist per slug, printing only after the save: the old code
+        // printed "requeued" inside the loop but saved once after it, so a
+        // crash lost already-reported requeues.
+        state.save(&state_path)?;
         requeued.push(slug.clone());
         println!("  requeued {slug}");
     }
 
-    state.save(&state_path)?;
     persist_checklist(&review_dir, &state)?;
-    status::report(
+    report_status(
         &review_dir,
         StatusPhase::Idle,
         "-",
@@ -2016,7 +2075,7 @@ pub fn requeue(repo: &Path, slugs: &[String], all: bool) -> Result<Vec<String>> 
             requeued.len(),
             requeued.join(", ")
         ),
-    )?;
+    );
     Ok(requeued)
 }
 
@@ -2035,17 +2094,33 @@ pub fn restart(repo: &Path) -> Result<usize> {
     if state.components.is_empty() {
         bail!("state has no components — run `gaggle init` first");
     }
+    // Same guard as `refresh`: restarting mid-run would wipe in-flight
+    // progress (active phases reset to pending, findings cleared).
+    if let Some(c) = state.components.values().find(|c| {
+        matches!(
+            c.phase,
+            Phase::Reviewing | Phase::Fixing | Phase::Verifying | Phase::Committing
+        )
+    }) {
+        bail!(
+            "cannot restart while a component is in an active phase ({} is {}). \
+             Wait for `gaggle run` to finish, or interrupt it.",
+            c.slug,
+            c.phase.as_str()
+        );
+    }
+    warn_if_status_looks_live(&review_dir);
     let n = state.components.len();
     state.restart_all();
     state.save(&state_path)?;
     persist_checklist(&review_dir, &state)?;
     clear_current_run_artifacts(&review_dir)?;
-    status::report(
+    report_status(
         &review_dir,
         StatusPhase::Idle,
         "-",
         &format!("restarted {n} component(s) to pending"),
-    )?;
+    );
     Ok(n)
 }
 
@@ -2072,6 +2147,516 @@ fn clear_current_run_artifacts(review_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Result of reconciling a newly discovered checklist onto existing state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshDelta {
+    pub added: Vec<String>,
+    pub dropped: Vec<String>,
+    pub kept: Vec<String>,
+}
+
+/// Rediscover components against the current tree without wiping `.review/`.
+///
+/// Requires a usable checklist. Refuses if any component is in an active
+/// loop phase. Kept slugs keep phase/findings/commit; new slugs are pending;
+/// dropped slugs leave both files. Project-wide `verify` / `final_verify`
+/// are rewritten the same way as `init`.
+pub fn refresh(repo: &Path) -> Result<RefreshDelta> {
+    let review_dir = repo.join(crate::REVIEW_DIR);
+    let checklist_path = review_dir.join("checklist.md");
+    let state_path = review_dir.join("state.json");
+
+    let old_list = checklist::load(&checklist_path)?;
+    if old_list.is_empty() {
+        bail!(
+            "no usable checklist at {} — run `gaggle init` first",
+            checklist_path.display()
+        );
+    }
+
+    let mut state = load_state_strict(&state_path)?;
+    if let Some(c) = state.components.values().find(|c| {
+        matches!(
+            c.phase,
+            Phase::Reviewing | Phase::Fixing | Phase::Verifying | Phase::Committing
+        )
+    }) {
+        bail!(
+            "cannot refresh while a component is in an active phase ({} is {}). \
+             Wait for `gaggle run` to finish, or interrupt it.",
+            c.slug,
+            c.phase.as_str()
+        );
+    }
+    warn_if_status_looks_live(&review_dir);
+
+    recipes::ensure_config(repo)?;
+    let snapshot = state.components.clone();
+    let old_slugs: Vec<String> = old_list.iter().map(|c| c.slug.clone()).collect();
+
+    let discovered = run_ai_discovery(repo)?;
+    let mut list = components_from_discovery(&discovered);
+    warn_missing_paths(repo, &list);
+
+    let delta = apply_refresh(&snapshot, &old_slugs, &mut list, &mut state);
+
+    checklist::save(&checklist_path, &list)?;
+    state.save(&state_path)?;
+    remove_dropped_findings(&review_dir, &delta.dropped);
+    report_status(
+        &review_dir,
+        StatusPhase::Idle,
+        "-",
+        &format!(
+            "refreshed checklist: {} added, {} dropped, {} kept",
+            delta.added.len(),
+            delta.dropped.len(),
+            delta.kept.len()
+        ),
+    );
+    Ok(delta)
+}
+
+fn load_state_strict(path: &Path) -> Result<State> {
+    if !path.exists() {
+        return Ok(State::default());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "{} is corrupt ({e}) — fix or remove it before refreshing \
+             (do not delete the file unless you intend to lose progress)",
+            path.display()
+        )
+    })
+}
+
+/// Returns true when a warning was printed (live-looking status.json).
+fn warn_if_status_looks_live(review_dir: &Path) -> bool {
+    let path = review_dir.join("status.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(s) = serde_json::from_str::<crate::status::Status>(&text) else {
+        return false;
+    };
+    let live = !matches!(s.phase.as_str(), "idle" | "done" | "failed");
+    if live {
+        eprintln!(
+            "  ⚠ `.review/status.json` is `{}` — a `gaggle run` may still be alive.\n    \
+             Do not refresh while a run is in progress (refresh can restore a stale snapshot\n    \
+             over in-flight work). Do not start `gaggle run` until refresh finishes.",
+            s.phase
+        );
+    }
+    live
+}
+
+/// Apply a newly discovered list onto an existing state.
+/// `old_slugs` = slugs from the pre-refresh checklist (operator-visible extras).
+/// `snapshot` = clone of state.components before sync.
+pub(crate) fn apply_refresh(
+    snapshot: &BTreeMap<String, ComponentState>,
+    old_slugs: &[String],
+    list: &mut [Component],
+    state: &mut State,
+) -> RefreshDelta {
+    let new: BTreeSet<String> = list.iter().map(|c| c.slug.clone()).collect();
+    let snap: BTreeSet<String> = snapshot.keys().cloned().collect();
+    let old: BTreeSet<String> = old_slugs.iter().cloned().collect();
+    let kept: Vec<String> = new.intersection(&snap).cloned().collect();
+    let added: Vec<String> = new.difference(&snap).cloned().collect();
+    let mut dropped: BTreeSet<String> = snap.difference(&new).cloned().collect();
+    dropped.extend(old.difference(&new).cloned());
+    let dropped: Vec<String> = dropped.into_iter().collect();
+    let delta = RefreshDelta {
+        added,
+        dropped,
+        kept,
+    };
+
+    for c in list.iter_mut() {
+        if c.verify.is_empty() {
+            if let Some(old) = snapshot.get(&c.slug) {
+                if !old.verify.is_empty() {
+                    c.verify = old.verify.clone();
+                }
+            }
+        }
+    }
+
+    for c in list.iter_mut() {
+        if snapshot
+            .get(&c.slug)
+            .is_some_and(|st| matches!(st.phase, Phase::Done | Phase::Failed))
+        {
+            c.done = true;
+        }
+    }
+
+    state.sync(list);
+
+    for (slug, old) in snapshot {
+        if let Some(row) = state.components.get_mut(slug) {
+            row.phase = old.phase;
+            row.findings = old.findings;
+            row.open = old.open;
+            row.detail = old.detail.clone();
+            row.commit = old.commit.clone();
+        }
+    }
+    delta
+}
+
+fn remove_dropped_findings(review_dir: &Path, dropped: &[String]) {
+    for slug in dropped {
+        let _ = std::fs::remove_file(findings_path(review_dir, slug));
+    }
+}
+
+#[cfg(test)]
+mod scaffold_tests {
+    use super::*;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "gaggle-scaffold-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn init_with_explicit_components_scaffolds_review_dir() {
+        let dir = unique_dir("init");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = init(
+            &dir,
+            &[
+                ("core".into(), "Core".into(), "HIGH".into()),
+                ("api".into(), "API".into(), "low".into()),
+            ],
+        )
+        .unwrap();
+        assert!(out.is_empty(), "explicit init discovers nothing");
+        let review = dir.join(".review");
+        assert!(review.join("checklist.md").exists());
+        assert!(review.join("config.toml").exists());
+        let state = State::load(&review.join("state.json")).unwrap();
+        assert_eq!(state.components.len(), 2);
+        // Tiers canonicalized through Component::new.
+        assert_eq!(state.get("core").unwrap().tier, "high");
+        assert_eq!(state.get("api").unwrap().phase, Phase::Pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_strict_missing_is_default_and_corrupt_errors() {
+        let dir = unique_dir("strict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("state.json");
+        assert!(load_state_strict(&p).unwrap().components.is_empty());
+        std::fs::write(&p, "{bad").unwrap();
+        let err = load_state_strict(&p).unwrap_err().to_string();
+        assert!(err.contains("corrupt"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_status_warns_only_for_active_phases() {
+        let dir = unique_dir("live");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(&review).unwrap();
+        // No status file and corrupt files are quiet.
+        assert!(!warn_if_status_looks_live(&review));
+        std::fs::write(review.join("status.json"), "{bad").unwrap();
+        assert!(!warn_if_status_looks_live(&review));
+        let write = |phase: &str| {
+            let s = crate::status::Status {
+                phase: phase.into(),
+                component: "-".into(),
+                detail: "x".into(),
+                ts: "t".into(),
+            };
+            std::fs::write(
+                review.join("status.json"),
+                serde_json::to_string(&s).unwrap(),
+            )
+            .unwrap();
+        };
+        write("idle");
+        assert!(!warn_if_status_looks_live(&review));
+        write("done");
+        assert!(!warn_if_status_looks_live(&review));
+        write("reviewing");
+        assert!(warn_if_status_looks_live(&review));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_refresh_keeps_progress_and_classifies_delta() {
+        let mut state = State::default();
+        state.sync(&[
+            Component::new("core", "Core", "high"),
+            Component::new("api", "API", "medium"),
+            Component::new("old", "Old", "low"),
+        ]);
+        // Record progress: core done with findings + commit, api quarantined.
+        for to in [
+            Phase::Reviewing,
+            Phase::Fixing,
+            Phase::Verifying,
+            Phase::Committing,
+            Phase::Done,
+        ] {
+            state::transition(&mut state, "core", to).unwrap();
+        }
+        state.set_findings("core", 5).unwrap();
+        state.components.get_mut("core").unwrap().commit = Some("abc".into());
+        state.components.get_mut("core").unwrap().verify = vec!["make x".into()];
+        state::transition(&mut state, "api", Phase::Reviewing).unwrap();
+        state::transition(&mut state, "api", Phase::Failed).unwrap();
+
+        let snapshot = state.components.clone();
+        let old_slugs = vec![
+            "core".to_string(),
+            "api".to_string(),
+            "old".to_string(),
+            "extra".to_string(), // checklist-only row, never in state
+        ];
+        let mut list = vec![
+            Component::new("core", "Core", "high"),
+            Component::new("api", "API", "medium"),
+            Component::new("new", "New", "low"),
+        ];
+        let delta = apply_refresh(&snapshot, &old_slugs, &mut list, &mut state);
+        assert_eq!(delta.added, vec!["new".to_string()]);
+        assert_eq!(delta.kept.len(), 2);
+        assert!(delta.dropped.contains(&"old".to_string()));
+        assert!(delta.dropped.contains(&"extra".to_string()));
+        // Done progress survives the rediscovery: checklist marked done,
+        // state row keeps phase/findings/commit.
+        assert!(list.iter().find(|c| c.slug == "core").unwrap().done);
+        let row = state.get("core").unwrap();
+        assert_eq!(row.phase, Phase::Done);
+        assert_eq!(row.findings, 5);
+        assert_eq!(row.commit.as_deref(), Some("abc"));
+        // Empty rediscovered verify inherits the snapshot's commands.
+        assert_eq!(
+            list.iter().find(|c| c.slug == "core").unwrap().verify,
+            vec!["make x"]
+        );
+        // Failed stays failed until an explicit requeue.
+        assert_eq!(state.get("api").unwrap().phase, Phase::Failed);
+        // Dropped slugs leave state entirely.
+        assert!(state.get("old").is_none());
+    }
+
+    #[test]
+    fn requeue_needs_state_and_failed_rows() {
+        let dir = unique_dir("requeue-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = requeue(&dir, &[], true).unwrap_err().to_string();
+        assert!(err.contains("nothing to requeue"), "{err}");
+        let err = restart(&dir).unwrap_err().to_string();
+        assert!(err.contains("run `gaggle init` first"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requeue_and_restart_roundtrip() {
+        let dir = unique_dir("requeue-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        init(
+            &dir,
+            &[
+                ("core".into(), "Core".into(), "high".into()),
+                ("api".into(), "API".into(), "low".into()),
+            ],
+        )
+        .unwrap();
+        // Nothing quarantined: --all is a successful no-op.
+        assert!(requeue(&dir, &[], true).unwrap().is_empty());
+        // Unknown slugs and non-quarantined rows are rejected.
+        let err = requeue(&dir, &["nope".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown component"), "{err}");
+        let err = requeue(&dir, &["core".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not failed"), "{err}");
+        // Quarantine core, then requeue it back to pending.
+        let state_path = dir.join(".review/state.json");
+        let mut state = State::load(&state_path).unwrap();
+        state::transition(&mut state, "core", Phase::Reviewing).unwrap();
+        state::transition(&mut state, "core", Phase::Failed).unwrap();
+        state.set_detail("core", "flake").unwrap();
+        state.save(&state_path).unwrap();
+        assert_eq!(
+            requeue(&dir, &["core".to_string()], false).unwrap(),
+            vec!["core"]
+        );
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Pending);
+        assert!(
+            state.get("core").unwrap().detail.contains("requeued"),
+            "requeue must note the prior detail"
+        );
+        // Restart resets every row for a fresh pass.
+        assert_eq!(restart(&dir).unwrap(), 2);
+        let state = State::load(&state_path).unwrap();
+        assert!(
+            state.components.values().all(|c| c.phase == Phase::Pending),
+            "restart must reset all rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_refuses_active_phases() {
+        let dir = unique_dir("restart-active");
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir, &[("core".into(), "Core".into(), "high".into())]).unwrap();
+        let state_path = dir.join(".review/state.json");
+        let mut state = State::load(&state_path).unwrap();
+        state::transition(&mut state, "core", Phase::Reviewing).unwrap();
+        state.save(&state_path).unwrap();
+        let err = restart(&dir).unwrap_err().to_string();
+        assert!(err.contains("active phase"), "{err}");
+        // Nothing was wiped by the refused restart.
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Reviewing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requeue_validates_all_before_mutating() {
+        let dir = unique_dir("requeue-atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        init(
+            &dir,
+            &[
+                ("core".into(), "Core".into(), "high".into()),
+                ("api".into(), "API".into(), "low".into()),
+            ],
+        )
+        .unwrap();
+        let state_path = dir.join(".review/state.json");
+        let mut state = State::load(&state_path).unwrap();
+        for slug in ["core", "api"] {
+            state::transition(&mut state, slug, Phase::Reviewing).unwrap();
+            state::transition(&mut state, slug, Phase::Failed).unwrap();
+        }
+        state.save(&state_path).unwrap();
+        // One bad slug fails the whole op — the good slug stays queued.
+        let err = requeue(&dir, &["core".to_string(), "nope".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown component"), "{err}");
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.get("core").unwrap().phase, Phase::Failed);
+        assert_eq!(state.get("api").unwrap().phase, Phase::Failed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_rejects_run_ids_outside_the_archive() {
+        let dir = unique_dir("history");
+        let runs = dir.join(".review/runs");
+        let ts = "20240101-000000";
+        std::fs::create_dir_all(runs.join(ts)).unwrap();
+        std::fs::write(runs.join(ts).join("final-report.md"), "# report\n").unwrap();
+        // A plant outside the archive that traversal would resolve to.
+        std::fs::create_dir_all(dir.join("secret")).unwrap();
+        std::fs::write(dir.join("secret/final-report.md"), "SECRET\n").unwrap();
+        // Legitimate ids still work (list and detail).
+        history(&dir, Some(ts)).unwrap();
+        history(&dir, None).unwrap();
+        // Traversal, absolute, and unknown ids are all rejected.
+        for evil in [
+            "../secret",
+            "../runs/20240101-000000",
+            "..",
+            ".",
+            "/tmp",
+            "nope",
+        ] {
+            let err = history(&dir, Some(evil)).unwrap_err().to_string();
+            assert!(err.contains("no archived run"), "{evil}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_never_fails_the_caller() {
+        // status::report on an unwritable review dir errors — the
+        // best-effort wrappers must swallow that, never abort the op.
+        let dir = unique_dir("telemetry");
+        std::fs::write(&dir, "a file, not a directory").unwrap();
+        assert!(status::report(&dir, StatusPhase::Idle, "-", "x").is_err());
+        let engine = Engine::new(&dir);
+        engine.report_status(StatusPhase::Idle, "-", "x");
+        report_status(&dir, StatusPhase::Idle, "-", "x");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn findings_snapshots_restore_prior_content_and_remove_synthetic() {
+        let dir = unique_dir("restore");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        let engine = Engine::new(&dir);
+        // Pre-gate state: core has real leftovers, api has no file.
+        std::fs::write(review.join("findings").join("core.txt"), "real leftovers").unwrap();
+        let mut snaps = std::collections::BTreeMap::new();
+        snaps.insert(
+            "core".to_string(),
+            read_optional(&engine.findings_path("core")),
+        );
+        snaps.insert(
+            "api".to_string(),
+            read_optional(&engine.findings_path("api")),
+        );
+        // Gate-fix cycles overwrite core's file and create api's…
+        std::fs::write(
+            review.join("findings").join("core.txt"),
+            "FULL-SUITE synthetic",
+        )
+        .unwrap();
+        std::fs::write(
+            review.join("findings").join("api.txt"),
+            "FULL-SUITE synthetic",
+        )
+        .unwrap();
+        engine.restore_findings_snapshots(&snaps);
+        // …and every exit restores the pre-gate state.
+        assert_eq!(
+            std::fs::read_to_string(review.join("findings").join("core.txt")).unwrap(),
+            "real leftovers"
+        );
+        assert!(!review.join("findings").join("api.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_dropped_findings_deletes_only_listed() {
+        let dir = unique_dir("findings");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        std::fs::write(review.join("findings").join("gone.txt"), "x").unwrap();
+        std::fs::write(review.join("findings").join("kept.txt"), "y").unwrap();
+        remove_dropped_findings(&review, &["gone".to_string()]);
+        assert!(!review.join("findings").join("gone.txt").exists());
+        assert!(review.join("findings").join("kept.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -2119,9 +2704,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_still_open_is_empty() {
-        let v = json!({"status": "ok"});
-        assert!(parse_still_open(&v).unwrap().is_empty());
+    fn missing_still_open_is_malformed_not_closed() {
+        // A missing/null/empty/misshapen key must NOT read as "closed":
+        // the caller keeps the work order open on Err.
+        for v in [
+            json!({"status": "ok"}),
+            json!({"still_open": null}),
+            json!({"still_open": ""}),
+            json!({"still_open": 42}),
+        ] {
+            let err = parse_still_open(&v).unwrap_err().to_string();
+            assert!(err.contains("still_open"), "{v}: {err}");
+        }
+        // …while an explicit empty array still closes the work order.
+        assert!(
+            parse_still_open(&json!({"still_open": []}))
+                .unwrap()
+                .is_empty()
+        );
+        // …and a lone string stays a lenient single-item read.
+        assert_eq!(
+            parse_still_open(&json!({"still_open": "leak"})).unwrap(),
+            vec!["leak"]
+        );
     }
 
     #[test]
@@ -2250,5 +2855,454 @@ mod tests {
             resolve_gate_component(&s, "", "nothing matches"),
             "final-gate"
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use crate::state::Phase;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "gaggle-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_checklist(review: &Path, comps: &[Component]) {
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        checklist::save(&review.join("checklist.md"), comps).unwrap();
+    }
+
+    fn state_with(comps: &[Component]) -> State {
+        let mut state = State::default();
+        state.sync(comps);
+        state
+    }
+
+    fn park(
+        state: &mut State,
+        slug: &str,
+        phase: Phase,
+        findings: usize,
+        detail: &str,
+        commit: Option<&str>,
+    ) {
+        let row = state.components.get_mut(slug).unwrap();
+        row.phase = phase;
+        row.findings = findings;
+        row.detail = detail.to_string();
+        row.commit = commit.map(|s| s.to_string());
+    }
+
+    #[test]
+    fn refresh_without_review_dir_errors() {
+        let dir = unique_dir("refresh-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = refresh(&dir).unwrap_err().to_string();
+        assert!(err.contains("gaggle init"), "{err}");
+        assert!(!dir.join(".review").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_refuses_active_phases_without_rewrite() {
+        for phase in [
+            Phase::Reviewing,
+            Phase::Fixing,
+            Phase::Verifying,
+            Phase::Committing,
+        ] {
+            let dir = unique_dir("refresh-active");
+            let review = dir.join(".review");
+            let mut comps = vec![Component::new("core", "Core", "high")];
+            comps[0].paths = vec!["src/lib.rs".into()];
+            write_checklist(&review, &comps);
+            let mut state = state_with(&comps);
+            park(&mut state, "core", phase, 1, "in flight", Some("abc"));
+            state.save(&review.join("state.json")).unwrap();
+            let before_cl = std::fs::read_to_string(review.join("checklist.md")).unwrap();
+            let before_st = std::fs::read_to_string(review.join("state.json")).unwrap();
+
+            let err = refresh(&dir).unwrap_err().to_string();
+            assert!(err.contains("active phase"), "{err}");
+            assert!(err.contains("core"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(review.join("checklist.md")).unwrap(),
+                before_cl
+            );
+            assert_eq!(
+                std::fs::read_to_string(review.join("state.json")).unwrap(),
+                before_st
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn apply_refresh_adds_pending_and_keeps_done_through_run_prefix() {
+        let dir = unique_dir("refresh-add");
+        let review = dir.join(".review");
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        old[0].paths = vec!["src/lib.rs".into()];
+        write_checklist(&review, &old);
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 2, "fixed", Some("abc"));
+        state.save(&review.join("state.json")).unwrap();
+        let snapshot = state.components.clone();
+
+        let mut new_list = vec![
+            Component::new("core", "Core", "high"),
+            Component::new("new-api", "New API", "medium"),
+        ];
+        new_list[0].paths = vec!["src/lib.rs".into()];
+        new_list[1].paths = vec!["src/api.rs".into()];
+        let old_slugs = vec!["core".into()];
+        let delta = apply_refresh(&snapshot, &old_slugs, &mut new_list, &mut state);
+        checklist::save(&review.join("checklist.md"), &new_list).unwrap();
+        state.save(&review.join("state.json")).unwrap();
+
+        assert_eq!(delta.added, vec!["new-api"]);
+        assert!(delta.dropped.is_empty());
+        assert_eq!(delta.kept, vec!["core"]);
+        let core = state.get("core").unwrap();
+        assert_eq!(core.phase, Phase::Done);
+        assert_eq!(core.findings, 2);
+        assert_eq!(core.commit.as_deref(), Some("abc"));
+        assert_eq!(state.get("new-api").unwrap().phase, Phase::Pending);
+        let comps = checklist::load(&review.join("checklist.md")).unwrap();
+        let core_c = comps.iter().find(|c| c.slug == "core").unwrap();
+        let new_c = comps.iter().find(|c| c.slug == "new-api").unwrap();
+        assert!(core_c.done);
+        assert!(!new_c.done);
+
+        let comps = checklist::load(&review.join("checklist.md")).unwrap();
+        let mut loaded = State::load(&review.join("state.json")).unwrap();
+        loaded.sync(&comps);
+        assert_eq!(loaded.get("core").unwrap().phase, Phase::Done);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_refresh_drops_vanished_slug() {
+        let mut old = vec![
+            Component::new("core", "Core", "high"),
+            Component::new("legacy", "Legacy", "low"),
+        ];
+        old[0].done = true;
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 1, "", None);
+        let snapshot = state.components.clone();
+        let mut new_list = vec![Component::new("core", "Core", "high")];
+        let delta = apply_refresh(
+            &snapshot,
+            &["core".into(), "legacy".into()],
+            &mut new_list,
+            &mut state,
+        );
+        assert_eq!(delta.dropped, vec!["legacy"]);
+        assert_eq!(delta.kept, vec!["core"]);
+        assert!(state.get("legacy").is_none());
+        assert!(!new_list.iter().any(|c| c.slug == "legacy"));
+    }
+
+    #[test]
+    fn apply_refresh_does_not_clear_runs_or_final_report() {
+        let dir = unique_dir("refresh-runs");
+        let review = dir.join(".review");
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        write_checklist(&review, &old);
+        std::fs::write(review.join("final-report.md"), "keep").unwrap();
+        std::fs::create_dir_all(review.join("runs").join("keep-me")).unwrap();
+        std::fs::write(
+            review.join("runs").join("keep-me").join("final-report.md"),
+            "arch",
+        )
+        .unwrap();
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 0, "", None);
+        let snapshot = state.components.clone();
+        let mut new_list = vec![Component::new("core", "Core", "high")];
+        apply_refresh(&snapshot, &["core".into()], &mut new_list, &mut state);
+        checklist::save(&review.join("checklist.md"), &new_list).unwrap();
+        state.save(&review.join("state.json")).unwrap();
+        remove_dropped_findings(&review, &[]);
+        assert!(review.join("final-report.md").exists());
+        assert!(
+            review
+                .join("runs")
+                .join("keep-me")
+                .join("final-report.md")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_refresh_delta_keyed_on_snapshot_and_sorted() {
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 0, "", None);
+        state.components.insert(
+            "db".into(),
+            ComponentState {
+                slug: "db".into(),
+                name: "DB".into(),
+                tier: "high".into(),
+                phase: Phase::Failed,
+                findings: 3,
+                open: 3,
+                detail: "budget spent".into(),
+                paths: vec!["db".into()],
+                verify: vec![],
+                commit: None,
+            },
+        );
+        let snapshot = state.components.clone();
+        let mut new_list = vec![
+            Component::new("core", "Core", "high"),
+            Component::new("new-api", "New API", "medium"),
+            Component::new("db", "DB", "high"),
+        ];
+        let delta = apply_refresh(
+            &snapshot,
+            &["core".into(), "legacy".into()],
+            &mut new_list,
+            &mut state,
+        );
+        assert_eq!(delta.added, vec!["new-api"]);
+        assert_eq!(delta.dropped, vec!["legacy"]);
+        assert_eq!(delta.kept, vec!["core", "db"]);
+        let db = new_list.iter().find(|c| c.slug == "db").unwrap();
+        assert!(db.done);
+        assert_eq!(state.get("db").unwrap().phase, Phase::Failed);
+    }
+
+    #[test]
+    fn apply_refresh_zero_added_dropped() {
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 0, "", None);
+        let snapshot = state.components.clone();
+        let mut new_list = vec![Component::new("core", "Core", "high")];
+        let delta = apply_refresh(&snapshot, &["core".into()], &mut new_list, &mut state);
+        assert!(delta.added.is_empty());
+        assert!(delta.dropped.is_empty());
+        assert_eq!(delta.kept, vec!["core"]);
+    }
+
+    #[test]
+    fn kept_failed_stays_failed_through_run_prefix() {
+        let dir = unique_dir("refresh-failed");
+        let review = dir.join(".review");
+        let old = vec![Component::new("db", "DB", "high")];
+        write_checklist(&review, &old);
+        let mut state = state_with(&old);
+        park(&mut state, "db", Phase::Failed, 2, "budget spent", None);
+        state.save(&review.join("state.json")).unwrap();
+        let snapshot = state.components.clone();
+        let mut new_list = vec![Component::new("db", "DB", "high")];
+        apply_refresh(&snapshot, &["db".into()], &mut new_list, &mut state);
+        checklist::save(&review.join("checklist.md"), &new_list).unwrap();
+        state.save(&review.join("state.json")).unwrap();
+
+        let db = state.get("db").unwrap();
+        assert_eq!(db.phase, Phase::Failed);
+        assert_eq!(db.findings, 2);
+        assert_eq!(db.detail, "budget spent");
+        let comps = checklist::load(&review.join("checklist.md")).unwrap();
+        assert!(comps[0].done);
+
+        let comps = checklist::load(&review.join("checklist.md")).unwrap();
+        let mut loaded = State::load(&review.join("state.json")).unwrap();
+        loaded.sync(&comps);
+        let db = loaded.get("db").unwrap();
+        assert_eq!(db.phase, Phase::Failed);
+        assert_eq!(db.findings, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_fields_match_refresh_delta() {
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        let mut state = state_with(&old);
+        park(
+            &mut state,
+            "core",
+            Phase::Done,
+            4,
+            "fixed + committed abc",
+            Some("abc"),
+        );
+        let snapshot = state.components.clone();
+        let mut new_list = vec![
+            Component::new("core", "Core", "high"),
+            Component::new("new-api", "New API", "medium"),
+        ];
+        apply_refresh(&snapshot, &["core".into()], &mut new_list, &mut state);
+        let core = state.get("core").unwrap();
+        assert_eq!(core.phase.as_str(), "done");
+        assert_eq!(core.findings, 4);
+        assert_eq!(core.detail, "fixed + committed abc");
+        let new = state.get("new-api").unwrap();
+        assert_eq!(new.phase.as_str(), "pending");
+        assert_eq!(new.findings, 0);
+    }
+
+    #[test]
+    fn init_explicit_still_wipes_progress() {
+        let dir = unique_dir("refresh-init-wipe");
+        let review = dir.join(".review");
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        old[0].paths = vec!["src/lib.rs".into()];
+        write_checklist(&review, &old);
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 9, "kept", Some("abc"));
+        state.save(&review.join("state.json")).unwrap();
+
+        init(&dir, &[("core".into(), "Core".into(), "high".into())]).unwrap();
+        let state = State::load(&review.join("state.json")).unwrap();
+        let core = state.get("core").unwrap();
+        assert_eq!(core.phase, Phase::Pending);
+        assert_eq!(core.findings, 0);
+        assert!(core.commit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_refresh_keeps_snapshot_verify_when_discovery_omits_it() {
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        old[0].verify = vec!["go test ./db".into()];
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 0, "", None);
+        let snapshot = state.components.clone();
+        let mut new_list = vec![Component::new("core", "Core", "high")];
+        apply_refresh(&snapshot, &["core".into()], &mut new_list, &mut state);
+        assert_eq!(state.get("core").unwrap().verify, vec!["go test ./db"]);
+        assert_eq!(new_list[0].verify, vec!["go test ./db"]);
+    }
+
+    #[test]
+    fn persist_checklist_checks_failed_and_restart_unchecks() {
+        let dir = unique_dir("refresh-persist-failed");
+        let review = dir.join(".review");
+        let comps = vec![Component::new("db", "DB", "high")];
+        write_checklist(&review, &comps);
+        let mut state = state_with(&comps);
+        park(&mut state, "db", Phase::Failed, 1, "boom", None);
+        persist_checklist(&review, &state).unwrap();
+        let loaded = checklist::load(&review.join("checklist.md")).unwrap();
+        assert!(loaded[0].done, "Failed must persist as [x]");
+
+        state.restart_all();
+        persist_checklist(&review, &state).unwrap();
+        let loaded = checklist::load(&review.join("checklist.md")).unwrap();
+        assert!(!loaded[0].done, "Pending after restart must be [ ]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrade_failed_unchecked_still_requeues_on_sync() {
+        let dir = unique_dir("refresh-upgrade-footgun");
+        let review = dir.join(".review");
+        let comps = vec![Component::new("db", "DB", "high")];
+        write_checklist(&review, &comps);
+        let mut state = state_with(&comps);
+        park(&mut state, "db", Phase::Failed, 2, "budget spent", None);
+        state.save(&review.join("state.json")).unwrap();
+
+        let comps = checklist::load(&review.join("checklist.md")).unwrap();
+        assert!(!comps[0].done);
+        let mut loaded = State::load(&review.join("state.json")).unwrap();
+        loaded.sync(&comps);
+        let db = loaded.get("db").unwrap();
+        assert_eq!(db.phase, Phase::Pending);
+        assert_eq!(db.findings, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropped_findings_removed_kept_remain_sanitized() {
+        let dir = unique_dir("refresh-findings");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(review.join("findings")).unwrap();
+        let kept = findings_path(&review, "core");
+        let dropped = findings_path(&review, "../evil");
+        std::fs::write(&kept, "keep").unwrap();
+        std::fs::write(&dropped, "drop").unwrap();
+        assert_eq!(dropped.file_name().unwrap(), "___evil.txt");
+        remove_dropped_findings(&review, &["../evil".into()]);
+        assert!(kept.exists());
+        assert!(!dropped.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_state_errors_without_rewriting_checklist() {
+        let dir = unique_dir("refresh-corrupt");
+        let review = dir.join(".review");
+        let comps = vec![Component::new("core", "Core", "high")];
+        write_checklist(&review, &comps);
+        std::fs::write(review.join("state.json"), "{not json").unwrap();
+        let before = std::fs::read_to_string(review.join("checklist.md")).unwrap();
+        let err = refresh(&dir).unwrap_err().to_string();
+        assert!(err.contains("corrupt"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(review.join("checklist.md")).unwrap(),
+            before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_live_looking_warns_not_refuses() {
+        let dir = unique_dir("refresh-status-warn");
+        let review = dir.join(".review");
+        std::fs::create_dir_all(&review).unwrap();
+        std::fs::write(
+            review.join("status.json"),
+            r#"{"phase":"verifying","component":"-","detail":"final","ts":"t"}"#,
+        )
+        .unwrap();
+        assert!(warn_if_status_looks_live(&review));
+        std::fs::write(
+            review.join("status.json"),
+            r#"{"phase":"idle","component":"-","detail":"ok","ts":"t"}"#,
+        )
+        .unwrap();
+        assert!(!warn_if_status_looks_live(&review));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_refresh_updates_paths_name_tier() {
+        let mut old = vec![Component::new("core", "Core", "high")];
+        old[0].done = true;
+        old[0].paths = vec!["src/old.rs".into()];
+        let mut state = state_with(&old);
+        park(&mut state, "core", Phase::Done, 1, "", Some("abc"));
+        let snapshot = state.components.clone();
+        let mut new_list = vec![Component::new("core", "Core library", "medium")];
+        new_list[0].paths = vec!["src/lib.rs".into()];
+        apply_refresh(&snapshot, &["core".into()], &mut new_list, &mut state);
+        let row = state.get("core").unwrap();
+        assert_eq!(row.phase, Phase::Done);
+        assert_eq!(row.name, "Core library");
+        assert_eq!(row.tier, "medium");
+        assert_eq!(row.paths, vec!["src/lib.rs"]);
+        assert_eq!(row.commit.as_deref(), Some("abc"));
     }
 }
